@@ -1,0 +1,578 @@
+"""SQLite 数据层。
+
+单进程多线程：每个线程一条连接，写操作串行化。
+所有行带一个全局递增的 rev，用于 SSE 增量推送。
+"""
+from __future__ import annotations
+
+import itertools
+import shutil
+import sqlite3
+import threading
+import time
+from typing import Any, Iterable
+
+from .config import DB_PATH, IMAGES_DIR, LIBRARY_DIR, ensure_dirs, safe_dir_name
+
+_local = threading.local()
+_write_lock = threading.Lock()
+_rev_lock = threading.Lock()
+_rev_counter = itertools.count(1)
+
+TASK_PENDING = "pending"
+TASK_RUNNING = "running"
+TASK_COMPLETED = "completed"
+TASK_FAILED = "failed"
+
+ITEM_PENDING = "pending"
+ITEM_SEARCHING = "searching"
+ITEM_DOWNLOADING = "downloading"
+ITEM_DONE = "done"
+ITEM_NOTFOUND = "notfound"
+ITEM_FAILED = "failed"
+
+IMG_PENDING = "pending"
+IMG_DOWNLOADING = "downloading"
+IMG_DONE = "done"
+IMG_FAILED = "failed"
+IMG_SKIPPED = "skipped"  # 站点返回的占位图（多张内容完全相同），跳过不展示
+
+ITEM_TERMINAL = (ITEM_DONE, ITEM_NOTFOUND, ITEM_FAILED)
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS tasks (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    raw_text    TEXT    NOT NULL DEFAULT '',
+    status      TEXT    NOT NULL DEFAULT 'pending',
+    total       INTEGER NOT NULL DEFAULT 0,
+    finished    INTEGER NOT NULL DEFAULT 0,
+    error       TEXT,
+    rev         INTEGER NOT NULL DEFAULT 0,
+    created_at  REAL    NOT NULL,
+    updated_at  REAL    NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS items (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id     INTEGER NOT NULL,
+    seq         INTEGER NOT NULL DEFAULT 0,
+    code        TEXT    NOT NULL,
+    link        TEXT,
+    status      TEXT    NOT NULL DEFAULT 'pending',
+    detail_url  TEXT,
+    title       TEXT,
+    error       TEXT,
+    cached      INTEGER NOT NULL DEFAULT 0,
+    rev         INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_items_task ON items(task_id, seq);
+CREATE INDEX IF NOT EXISTS idx_items_code ON items(code);
+
+CREATE TABLE IF NOT EXISTS images (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id     INTEGER NOT NULL,
+    item_id     INTEGER NOT NULL,
+    seq         INTEGER NOT NULL DEFAULT 0,
+    kind        TEXT    NOT NULL,
+    url         TEXT,
+    path        TEXT,
+    status      TEXT    NOT NULL DEFAULT 'pending',
+    attempts    INTEGER NOT NULL DEFAULT 0,
+    error       TEXT,
+    rev         INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_images_task ON images(task_id, rev);
+CREATE INDEX IF NOT EXISTS idx_images_item ON images(item_id, seq);
+
+-- 统一图库：按番号索引，跨任务复用，避免重复下载
+CREATE TABLE IF NOT EXISTS library (
+    code        TEXT PRIMARY KEY,
+    detail_url  TEXT,
+    title       TEXT,
+    updated_at  REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS library_images (
+    code        TEXT    NOT NULL,
+    seq         INTEGER NOT NULL,
+    kind        TEXT    NOT NULL,
+    url         TEXT,
+    path        TEXT,
+    status      TEXT    NOT NULL,
+    PRIMARY KEY (code, seq)
+);
+
+-- 删除日志：SSE 只能推送"变更"，删掉的行需要一个墓碑告知前端移除
+CREATE TABLE IF NOT EXISTS removals (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id     INTEGER NOT NULL,
+    kind        TEXT    NOT NULL,
+    ref_id      INTEGER NOT NULL,
+    rev         INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_removals_task ON removals(task_id, rev);
+"""
+
+
+def conn() -> sqlite3.Connection:
+    c = getattr(_local, "c", None)
+    if c is None:
+        c = sqlite3.connect(str(DB_PATH), timeout=30, check_same_thread=False)
+        c.row_factory = sqlite3.Row
+        c.execute("PRAGMA journal_mode=WAL")
+        c.execute("PRAGMA synchronous=NORMAL")
+        _local.c = c
+    return c
+
+
+def next_rev() -> int:
+    with _rev_lock:
+        return next(_rev_counter)
+
+
+def init() -> None:
+    ensure_dirs()
+    with _write_lock, conn() as c:
+        c.executescript(SCHEMA)
+        _migrate(c)
+        row = c.execute(
+            "SELECT MAX(r) AS m FROM ("
+            " SELECT MAX(rev) AS r FROM tasks"
+            " UNION ALL SELECT MAX(rev) FROM items"
+            " UNION ALL SELECT MAX(rev) FROM images)"
+        ).fetchone()
+        start = (row["m"] or 0) + 1
+    global _rev_counter
+    with _rev_lock:
+        _rev_counter = itertools.count(start)
+    backfilled = library_backfill()
+    if backfilled:
+        print(f"[db] 已将 {backfilled} 个番号的历史下载结果归入统一图库")
+    moved = migrate_files_to_library()
+    if moved:
+        print(f"[db] 已把 {moved} 个文件移动到统一图库 data/images/library/")
+
+
+def _migrate(c: sqlite3.Connection) -> None:
+    """老库补列（CREATE TABLE IF NOT EXISTS 不会新增列）。"""
+    item_cols = {r["name"] for r in c.execute("PRAGMA table_info(items)")}
+    if "cached" not in item_cols:
+        c.execute("ALTER TABLE items ADD COLUMN cached INTEGER NOT NULL DEFAULT 0")
+    if "link" not in item_cols:
+        c.execute("ALTER TABLE items ADD COLUMN link TEXT")
+    image_cols = {r["name"] for r in c.execute("PRAGMA table_info(images)")}
+    if "attempts" not in image_cols:
+        c.execute("ALTER TABLE images ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0")
+    c.commit()
+
+
+def _row(r: sqlite3.Row | None) -> dict[str, Any] | None:
+    return dict(r) if r is not None else None
+
+
+# ---------------------------------------------------------------- 写入
+
+def create_task(raw_text: str, entries: Iterable[Any]) -> int:
+    """建任务。
+
+    entries 支持三种写法：纯番号字符串 / (code, link) 元组 / {"code","link"} 字典，
+    便于老调用方（只传番号）继续工作。
+    """
+    rows: list[tuple[str, str | None]] = []
+    for e in entries:
+        if isinstance(e, str):
+            rows.append((e, None))
+        elif isinstance(e, dict):
+            rows.append((str(e["code"]), e.get("link")))
+        else:
+            code, link = e  # type: ignore[misc]
+            rows.append((str(code), link))
+
+    now = time.time()
+    with _write_lock, conn() as c:
+        cur = c.execute(
+            "INSERT INTO tasks(raw_text, status, total, finished, rev, created_at, updated_at)"
+            " VALUES(?,?,?,?,?,?,?)",
+            (raw_text, TASK_PENDING, len(rows), 0, next_rev(), now, now),
+        )
+        task_id = int(cur.lastrowid)
+        for i, (code, link) in enumerate(rows):
+            c.execute(
+                "INSERT INTO items(task_id, seq, code, link, status, rev) VALUES(?,?,?,?,?,?)",
+                (task_id, i, code, link, ITEM_PENDING, next_rev()),
+            )
+        c.commit()
+    return task_id
+
+
+def add_images(task_id: int, item_id: int, images: list[tuple[int, str, str]]) -> list[int]:
+    """images: [(seq, kind, url), ...]"""
+    ids: list[int] = []
+    with _write_lock, conn() as c:
+        for seq, kind, url in images:
+            cur = c.execute(
+                "INSERT INTO images(task_id, item_id, seq, kind, url, status, rev)"
+                " VALUES(?,?,?,?,?,?,?)",
+                (task_id, item_id, seq, kind, url, IMG_PENDING, next_rev()),
+            )
+            ids.append(int(cur.lastrowid))
+        c.commit()
+    return ids
+
+
+def clear_images(item_id: int) -> None:
+    with _write_lock, conn() as c:
+        c.execute("DELETE FROM images WHERE item_id=?", (item_id,))
+        c.commit()
+
+
+def touch_task(task_id: int, **fields: Any) -> None:
+    fields["rev"] = next_rev()
+    fields["updated_at"] = time.time()
+    sets = ", ".join(f"{k}=?" for k in fields)
+    with _write_lock, conn() as c:
+        c.execute(f"UPDATE tasks SET {sets} WHERE id=?", (*fields.values(), task_id))
+        c.commit()
+
+
+def set_item(item_id: int, **fields: Any) -> None:
+    fields["rev"] = next_rev()
+    sets = ", ".join(f"{k}=?" for k in fields)
+    with _write_lock, conn() as c:
+        c.execute(f"UPDATE items SET {sets} WHERE id=?", (*fields.values(), item_id))
+        c.commit()
+
+
+def set_image(image_id: int, **fields: Any) -> None:
+    fields["rev"] = next_rev()
+    sets = ", ".join(f"{k}=?" for k in fields)
+    with _write_lock, conn() as c:
+        c.execute(f"UPDATE images SET {sets} WHERE id=?", (*fields.values(), image_id))
+        c.commit()
+
+
+def refresh_counts(task_id: int) -> tuple[int, int, bool]:
+    """统计已完成数量，返回 (finished, total, all_terminal)。"""
+    c = conn()
+    rows = c.execute("SELECT status FROM items WHERE task_id=?", (task_id,)).fetchall()
+    total = len(rows)
+    finished = sum(1 for r in rows if r["status"] in ITEM_TERMINAL)
+    with _write_lock, conn() as cc:
+        cc.execute(
+            "UPDATE tasks SET finished=?, total=? WHERE id=?", (finished, total, task_id)
+        )
+        cc.commit()
+    return finished, total, finished >= total and total > 0
+
+
+# ---------------------------------------------------------------- 读取
+
+def get_task(task_id: int) -> dict[str, Any] | None:
+    return _row(conn().execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone())
+
+
+def get_item(item_id: int) -> dict[str, Any] | None:
+    return _row(conn().execute("SELECT * FROM items WHERE id=?", (item_id,)).fetchone())
+
+
+def list_tasks(limit: int = 200) -> list[dict[str, Any]]:
+    rows = conn().execute(
+        "SELECT * FROM tasks ORDER BY id DESC LIMIT ?", (limit,)
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def list_items(task_id: int) -> list[dict[str, Any]]:
+    rows = conn().execute(
+        "SELECT * FROM items WHERE task_id=? ORDER BY seq, id", (task_id,)
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def list_images(task_id: int) -> list[dict[str, Any]]:
+    rows = conn().execute(
+        "SELECT * FROM images WHERE task_id=? ORDER BY item_id, seq, id", (task_id,)
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def snapshot(task_id: int) -> dict[str, Any]:
+    task = get_task(task_id)
+    return {
+        "task": task,
+        "items": list_items(task_id),
+        "images": list_images(task_id),
+    }
+
+
+def changes_since(task_id: int, rev: int) -> dict[str, Any]:
+    c = conn()
+    task = _row(c.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone())
+    items = [
+        dict(r)
+        for r in c.execute(
+            "SELECT * FROM items WHERE task_id=? AND rev>? ORDER BY rev", (task_id, rev)
+        ).fetchall()
+    ]
+    images = [
+        dict(r)
+        for r in c.execute(
+            "SELECT * FROM images WHERE task_id=? AND rev>? ORDER BY rev LIMIT 5000",
+            (task_id, rev),
+        ).fetchall()
+    ]
+    removed = {"items": [], "images": []}
+    for r in c.execute(
+        "SELECT kind, ref_id, rev FROM removals WHERE task_id=? AND rev>? ORDER BY rev",
+        (task_id, rev),
+    ).fetchall():
+        bucket = removed["items"] if r["kind"] == "item" else removed["images"]
+        bucket.append(int(r["ref_id"]))
+    new_rev = rev
+    if task:
+        new_rev = max(new_rev, task["rev"])
+    for r in items + images:
+        new_rev = max(new_rev, r["rev"])
+    max_removal = c.execute(
+        "SELECT MAX(rev) AS m FROM removals WHERE task_id=?", (task_id,)
+    ).fetchone()
+    new_rev = max(new_rev, int(max_removal["m"] or 0))
+    return {"task": task, "items": items, "images": images, "removed": removed, "rev": new_rev}
+
+
+def resumable_tasks() -> list[int]:
+    rows = conn().execute(
+        "SELECT id FROM tasks WHERE status IN (?,?) ORDER BY id", (TASK_PENDING, TASK_RUNNING)
+    ).fetchall()
+    return [int(r["id"]) for r in rows]
+
+
+def item_images(item_id: int) -> list[dict[str, Any]]:
+    rows = conn().execute(
+        "SELECT * FROM images WHERE item_id=? ORDER BY seq, id", (item_id,)
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def add_images_full(
+    task_id: int, item_id: int, rows: list[tuple[int, str, str, str | None, str]]
+) -> list[int]:
+    """rows: [(seq, kind, url, path, status), ...]"""
+    ids: list[int] = []
+    with _write_lock, conn() as c:
+        for seq, kind, url, path, status in rows:
+            cur = c.execute(
+                "INSERT INTO images(task_id, item_id, seq, kind, url, path, status, rev)"
+                " VALUES(?,?,?,?,?,?,?,?)",
+                (task_id, item_id, seq, kind, url, path, status, next_rev()),
+            )
+            ids.append(int(cur.lastrowid))
+        c.commit()
+    return ids
+
+
+# ---------------------------------------------------------------- 删除 / 重试
+
+def delete_task(task_id: int) -> None:
+    with _write_lock, conn() as c:
+        c.execute("DELETE FROM images WHERE task_id=?", (task_id,))
+        c.execute("DELETE FROM items WHERE task_id=?", (task_id,))
+        c.execute("DELETE FROM removals WHERE task_id=?", (task_id,))
+        c.execute("DELETE FROM tasks WHERE id=?", (task_id,))
+        c.commit()
+
+
+def delete_item(task_id: int, item_id: int) -> int:
+    """删除单个条目及其图片行，返回删除的图片数。
+
+    只删任务内的记录，本地图库文件保留（其它任务还可能复用）。
+    """
+    with _write_lock, conn() as c:
+        row = c.execute(
+            "SELECT id FROM items WHERE id=? AND task_id=?", (item_id, task_id)
+        ).fetchone()
+        if not row:
+            return 0
+        image_ids = [
+            int(r["id"]) for r in c.execute("SELECT id FROM images WHERE item_id=?", (item_id,))
+        ]
+        c.execute("DELETE FROM images WHERE item_id=?", (item_id,))
+        c.execute("DELETE FROM items WHERE id=?", (item_id,))
+        for image_id in image_ids:
+            c.execute(
+                "INSERT INTO removals(task_id, kind, ref_id, rev) VALUES(?,?,?,?)",
+                (task_id, "image", image_id, next_rev()),
+            )
+        c.execute(
+            "INSERT INTO removals(task_id, kind, ref_id, rev) VALUES(?,?,?,?)",
+            (task_id, "item", item_id, next_rev()),
+        )
+        c.commit()
+    return len(image_ids)
+
+
+def reset_for_retry(task_id: int) -> int:
+    """把失败图片重置为待下载并清空重试次数，返回重置的图片数。"""
+    rev = next_rev()
+    with _write_lock, conn() as c:
+        cur = c.execute(
+            "UPDATE images SET status=?, attempts=0, error=NULL, rev=?"
+            " WHERE task_id=? AND status=?",
+            (IMG_PENDING, rev, task_id, IMG_FAILED),
+        )
+        reset_images = cur.rowcount
+        c.execute(
+            "UPDATE items SET status=?, error=NULL, rev=? WHERE task_id=? AND status=?",
+            (ITEM_PENDING, rev, task_id, ITEM_FAILED),
+        )
+        c.execute(
+            "UPDATE items SET status=?, error=NULL, rev=? WHERE task_id=? AND id IN"
+            " (SELECT DISTINCT item_id FROM images WHERE task_id=? AND status=?)",
+            (ITEM_PENDING, rev, task_id, task_id, IMG_PENDING),
+        )
+        c.commit()
+    return reset_images
+
+
+# ---------------------------------------------------------------- 统一图库
+
+def library_get(code: str) -> dict[str, Any] | None:
+    c = conn()
+    row = c.execute("SELECT * FROM library WHERE code=?", (code,)).fetchone()
+    if not row:
+        return None
+    data = dict(row)
+    data["images"] = [
+        dict(r)
+        for r in c.execute(
+            "SELECT * FROM library_images WHERE code=? ORDER BY seq", (code,)
+        ).fetchall()
+    ]
+    return data
+
+
+def library_upsert(
+    code: str,
+    detail_url: str | None,
+    title: str | None,
+    images: list[dict[str, Any]],
+) -> None:
+    """把某个番号的最终结果写入图库（pending 状态不写，避免脏数据）。"""
+    keep = [i for i in images if i["status"] != IMG_PENDING]
+    if not keep:
+        return
+    with _write_lock, conn() as c:
+        c.execute(
+            "INSERT INTO library(code, detail_url, title, updated_at) VALUES(?,?,?,?)"
+            " ON CONFLICT(code) DO UPDATE SET detail_url=excluded.detail_url,"
+            " title=excluded.title, updated_at=excluded.updated_at",
+            (code, detail_url, title, time.time()),
+        )
+        c.execute("DELETE FROM library_images WHERE code=?", (code,))
+        c.executemany(
+            "INSERT INTO library_images(code, seq, kind, url, path, status)"
+            " VALUES(?,?,?,?,?,?)",
+            [(code, i["seq"], i["kind"], i["url"], i["path"], i["status"]) for i in keep],
+        )
+        c.commit()
+
+
+def library_backfill() -> int:
+    """把历史上已下载完成的结果补进图库（只跑一次，图库非空则跳过）。"""
+    c = conn()
+    if c.execute("SELECT COUNT(*) AS n FROM library").fetchone()["n"]:
+        return 0
+    rows = c.execute(
+        "SELECT i.code, i.detail_url, i.title, im.seq, im.kind, im.url, im.path, im.status"
+        " FROM items i JOIN images im ON im.item_id = i.id"
+        " WHERE i.status = ? AND im.status = ? AND im.path IS NOT NULL"
+        " ORDER BY i.id, im.seq",
+        (ITEM_DONE, IMG_DONE),
+    ).fetchall()
+    grouped: dict[str, dict[str, Any]] = {}
+    for r in rows:
+        entry = grouped.setdefault(
+            r["code"],
+            {"code": r["code"], "detail_url": r["detail_url"], "title": r["title"], "images": []},
+        )
+        entry["images"].append(
+            {
+                "seq": r["seq"],
+                "kind": r["kind"],
+                "url": r["url"],
+                "path": r["path"],
+                "status": r["status"],
+            }
+        )
+    with _write_lock, conn() as wc:
+        for entry in grouped.values():
+            wc.execute(
+                "INSERT OR IGNORE INTO library(code, detail_url, title, updated_at)"
+                " VALUES(?,?,?,?)",
+                (entry["code"], entry["detail_url"], entry["title"], time.time()),
+            )
+            wc.executemany(
+                "INSERT OR IGNORE INTO library_images(code, seq, kind, url, path, status)"
+                " VALUES(?,?,?,?,?,?)",
+                [
+                    (entry["code"], i["seq"], i["kind"], i["url"], i["path"], i["status"])
+                    for i in entry["images"]
+                ],
+            )
+        wc.commit()
+    return len(grouped)
+
+
+def migrate_files_to_library() -> int:
+    """把历史遗留的 {任务id}/{番号}/xxx.jpg 迁移到 library/{番号}/，并改写库中路径。
+
+    按文件系统扫描而不是按数据库行，这样连"数据库行被清掉但文件还在"的
+    孤儿文件也能归位。
+    """
+    moved = 0
+    try:
+        task_dirs = [d for d in IMAGES_DIR.iterdir() if d.is_dir() and d.name.isdigit()]
+    except OSError:
+        return 0
+
+    for task_dir in sorted(task_dirs):
+        try:
+            code_dirs = [d for d in task_dir.iterdir() if d.is_dir()]
+        except OSError:
+            continue
+        for code_dir in sorted(code_dirs):
+            dst_dir = LIBRARY_DIR / safe_dir_name(code_dir.name)
+            try:
+                files = [f for f in code_dir.iterdir() if f.is_file()]
+            except OSError:
+                continue
+            for f in sorted(files):
+                dst = dst_dir / f.name
+                old_rel = f.relative_to(IMAGES_DIR).as_posix()
+                try:
+                    if dst.exists():
+                        f.unlink()  # 图库里已有同名文件，删掉旧副本
+                    else:
+                        dst_dir.mkdir(parents=True, exist_ok=True)
+                        shutil.move(str(f), str(dst))
+                except OSError:
+                    continue
+                new_rel = dst.relative_to(IMAGES_DIR).as_posix()
+                with _write_lock, conn() as wc:
+                    wc.execute("UPDATE images SET path=? WHERE path=?", (new_rel, old_rel))
+                    wc.execute(
+                        "UPDATE library_images SET path=? WHERE path=?", (new_rel, old_rel)
+                    )
+                    wc.commit()
+                moved += 1
+            try:
+                if not any(code_dir.iterdir()):
+                    code_dir.rmdir()
+            except OSError:
+                pass
+        try:
+            if not any(task_dir.iterdir()):
+                task_dir.rmdir()
+        except OSError:
+            pass
+    return moved
