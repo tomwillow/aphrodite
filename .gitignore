@@ -6,3 +6,5 @@ data/
 web/node_modules/
 web/dist/
 .DS_Store
+# config_compose.sh 每次写文件前的备份
+docker-compose.yml.bak

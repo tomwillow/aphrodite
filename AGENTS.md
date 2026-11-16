@@ -34,6 +34,27 @@ cd web && npm test
 
 测试规模：后端 ~40 个用例（`backend/tests/`），前端 ~30 个（`web/src/**/*.test.ts`）。**当前基线必须全绿。**
 
+## Docker 部署（Linux）
+
+只有 Docker，不需要装 python / node：前端 dist 与后端依赖都在镜像构建里完成。
+
+```bash
+scripts/deploy.sh              # 一键：构建镜像 → 交互式生成 compose → up -d → 等健康检查
+scripts/build_image.sh         # 只构建镜像（-t 改标签，--no-cache 重来）
+scripts/config_compose.sh      # 只交互式生成/修改 docker-compose.yml（-y 全用现有值）
+
+# 三个脚本跑完后，日常运维就回到原生 compose
+docker compose up -d / logs -f / restart / down
+```
+
+- 镜像名默认 `aphrodite:latest`，可用 `-t` 或环境变量 `APHRODITE_IMAGE` 改；`deploy.sh` 会把同一个名字传给构建和 compose。
+- `docker-compose.yml` **只引用镜像、不写 `build:`**——这是「前两个脚本跑完，`docker compose up -d` 就能起」的前提，别往里加 `build:`。
+- `config_compose.sh` 的交互默认值**取自现有 compose 文件**（`scripts/lib/common.sh` 里的 `yml_value/yml_port_spec/yml_data_dir`），所以手工改 compose 不会被覆盖，只会被当作下次的默认值。改生成模板要同时改这两处。
+- 容器内端口固定 8000（`run.py` / healthcheck / compose 都按它写），只有宿主端口与监听地址可配。
+- 数据全部在卷里：`<宿主机目录>:/data`（`aphrodite.db` + `images/library/`）。**镜像不含任何数据**，换机器只搬这个目录。
+- `data/`、`web/node_modules`、`web/dist`、`.venv` 由 `.dockerignore` 排除，不进构建上下文。
+- Windows 检出后拷到 Linux 跑，注意行尾：`.gitattributes` 已强制 `*.sh` / `Dockerfile` 用 LF。
+
 ## 目录
 
 ```
@@ -57,6 +78,14 @@ data/                     运行期数据，已 gitignore
   aphrodite.db            SQLite
   images/library/<番号>/   统一图库（cover.<ext> / sample-NN.<ext>）
   placeholder_hashes.txt  占位图 md5 黑名单（自学习）
+Dockerfile                多阶段构建：node 打前端 dist → python:3.12-slim 运行时
+.dockerignore             把 data/、node_modules、dist、.venv 挡在构建上下文外
+docker-compose.yml        单服务编排；只引用镜像，不含 build（脚本生成，可手改）
+scripts/
+  build_image.sh          构建镜像
+  config_compose.sh       交互式生成/修改 docker-compose.yml
+  deploy.sh               一键：构建 → 配置 → up -d → 健康检查
+  lib/common.sh           三者共用：日志、docker 探测、交互提问、yml 取值
 ```
 
 ## 数据流

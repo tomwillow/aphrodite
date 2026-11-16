@@ -1,0 +1,4 @@
+# 从 Windows 检出、在 Linux 上跑脚本时，强制 shell / Dockerfile 用 LF
+*.sh     text eol=lf
+Dockerfile text eol=lf
+*.yml    text eol=lf
