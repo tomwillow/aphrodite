@@ -5,7 +5,8 @@
     <div class="wrap">
       <router-link to="/" class="brand"><span class="dot"></span>Aphrodite</router-link>
       <nav>
-        <router-link to="/">新建任务</router-link>
+        <router-link to="/">影片管理</router-link>
+        <router-link to="/capture">番号抓取</router-link>
         <router-link to="/tasks">任务列表</router-link>
       </nav>
     </div>

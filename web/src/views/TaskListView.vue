@@ -75,7 +75,7 @@ function progressPct(t: Task) {
           共 {{ tasks.length }} 个任务<span v-if="runningCount"> · {{ runningCount }} 个执行中</span>
         </p>
       </div>
-      <router-link to="/" class="btn btn-primary btn-sm">新建任务</router-link>
+      <router-link to="/capture" class="btn btn-primary btn-sm">新建任务</router-link>
     </div>
 
     <p v-if="error" class="err small">{{ error }}</p>
@@ -83,7 +83,7 @@ function progressPct(t: Task) {
     <div v-if="loading" class="card empty">加载中…</div>
 
     <div v-else-if="!tasks.length" class="card empty">
-      还没有任务，<router-link to="/" class="accent-link">去创建一个</router-link>
+      还没有任务，<router-link to="/capture" class="accent-link">去创建一个</router-link>
     </div>
 
     <div v-else class="card list">
