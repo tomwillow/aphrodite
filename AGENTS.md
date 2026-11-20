@@ -39,9 +39,10 @@ cd web && npm test
 只有 Docker，不需要装 python / node：前端 dist 与后端依赖都在镜像构建里完成。
 
 ```bash
-scripts/deploy.sh              # 一键：构建镜像 → 交互式生成 compose → up -d → 等健康检查
+scripts/deploy.sh              # 一键：构建镜像 → 按 .env 生成 compose → up -d → 等健康检查（全程不提问；.env 缺失自动进交互）
+scripts/deploy.sh -i           # 强制交互式问答配置，答完写回项目根目录的 .env（-y 强制静默）
 scripts/build_image.sh         # 只构建镜像（-t 改标签，--no-cache 重来）
-scripts/config_compose.sh      # 只交互式生成/修改 docker-compose.yml（-y 全用现有值）
+scripts/config_compose.sh      # 只生成/修改 docker-compose.yml（-i 交互问答并回写 .env）
 
 # 三个脚本跑完后，日常运维就回到原生 compose
 docker compose up -d / logs -f / restart / down
@@ -49,7 +50,8 @@ docker compose up -d / logs -f / restart / down
 
 - 镜像名默认 `aphrodite:latest`，可用 `-t` 或环境变量 `APHRODITE_IMAGE` 改；`deploy.sh` 会把同一个名字传给构建和 compose。
 - `docker-compose.yml` **只引用镜像、不写 `build:`**——这是「前两个脚本跑完，`docker compose up -d` 就能起」的前提，别往里加 `build:`。
-- `config_compose.sh` 的交互默认值**取自现有 compose 文件**（`scripts/lib/common.sh` 里的 `yml_value/yml_port_spec/yml_data_dir`），所以手工改 compose 不会被覆盖，只会被当作下次的默认值。改生成模板要同时改这两处。
+- 部署配置**以项目根目录的 `.env` 为准**（KEY=value，已入 `.gitignore`）：`deploy.sh` 默认静默读取；`-i` 交互问答后回写 `.env`；`.env` 缺失时自动进入交互式（`-y` 强制静默）。键优先级：`.env` > 现有 compose > 内置默认值（`scripts/lib/common.sh` 的 `env_get/env_write_back`）。
+- `config_compose.sh` 的交互默认值按上述优先级取值，所以手工改 compose 只会作为 `.env` 缺键时的回退，改生成模板要同时改 `common.sh`/`config_compose.sh` 两处。
 - 容器内端口固定 8000（`run.py` / healthcheck / compose 都按它写），只有宿主端口与监听地址可配。
 - 数据全部在卷里：`<宿主机目录>:/data`（`aphrodite.db` + `images/library/`）。**镜像不含任何数据**，换机器只搬这个目录。
 - `data/`、`web/node_modules`、`web/dist`、`.venv` 由 `.dockerignore` 排除，不进构建上下文。
@@ -64,14 +66,17 @@ backend/
   codes.py                番号 / 下载链接解析（后端为准）
   crawler.py              JavBus 客户端：搜索、详情、图片下载、全局限速
   worker.py               后台执行器 Runner：任务级 + 条目级并发、取消、重试、占位图去重
-  db.py                   SQLite 数据层：schema、rev、读写、图库、迁移
+  films.py                影片管理：目录扫描同步、番号提取、缩略图规则、重命名/删除、协议脚本
+  db.py                   SQLite 数据层：schema、rev、读写、图库、影片目录/条目、迁移
   config.py               路径与全部可调参数（读环境变量）
   tests/                  pytest；conftest 把 APHRODITE_DATA 指到临时目录
 web/src/
   api.ts                  接口类型 + fetch 封装（类型与后端字段一一对应）
   lib/codes.ts            前端解析规则，必须与 backend/codes.py 保持一致
   lib/status.ts           状态文案 / 时间格式化
-  views/                  SubmitView / TaskListView / TaskDetailView
+  views/                  LibraryView(影片管理首页) / SubmitView / TaskListView / TaskDetailView
+  components/FilmTree.vue 影片管理：目录树侧栏（懒加载只含文件夹）
+  components/FilmCard.vue 影片管理：视频卡片（缩略图/番号角标/打开/重命名/删除）
   components/Lightbox.vue 大图查看
   styles.css              全部样式与 CSS 变量（不用 UI 框架）
 data/                     运行期数据，已 gitignore
@@ -83,9 +88,9 @@ Dockerfile                多阶段构建：node 打前端 dist → python:3.12-
 docker-compose.yml        单服务编排；只引用镜像，不含 build（脚本生成，可手改）
 scripts/
   build_image.sh          构建镜像
-  config_compose.sh       交互式生成/修改 docker-compose.yml
-  deploy.sh               一键：构建 → 配置 → up -d → 健康检查
-  lib/common.sh           三者共用：日志、docker 探测、交互提问、yml 取值
+  config_compose.sh       按 .env 生成/修改 docker-compose.yml（-i 交互问答并回写 .env）
+  deploy.sh               一键：构建 → 配置 → up -d → 健康检查（默认静默，-i 交互）
+  lib/common.sh           三者共用：日志、docker 探测、交互提问、yml 取值、.env 读写
 ```
 
 ## 数据流
@@ -127,6 +132,14 @@ scripts/
 **10. 文案用中文**
 后端错误文案、前端 UI 文案、注释、提交信息一律中文。`HTTPException` 的 `detail` 会直接显示给用户。
 
+**11. 影片管理的磁盘操作必须走 films.py**
+- 任何「root + 相对路径」都要过 `films.resolve_under_root()`（白名单 + 防穿越），`_norm_rel()` 拒绝 `..`
+- 番号提取一律复用 `codes.find_codes()` 取第一个；扫描入库时提取，磁盘与 DB 不一致时重提
+- 缩略图 = 视频同目录同名文件（换扩展名）；重命名时联动改名
+- 删除 = 真删磁盘文件（目录递归），执行前必须校验文件仍在；DB 行用 `film_delete_subtree` 清理后代
+- 扫描只扫「正在访问的那一级」，绝不做全库扫描；文件夹拼贴信息是响应时只读 peek，不写子级 DB
+- 协议处理器脚本内嵌在 `films.py`（HANDLER_* 常量），`scripts/aphrodite-play*` 是手动用副本，两边要同步改
+
 ## 可调参数（环境变量，见 config.py）
 
 | 变量 | 默认 | 作用 |
@@ -139,6 +152,8 @@ scripts/
 | `APHRODITE_TASK_WORKERS` | `2` | 同时执行的任务数 |
 | `APHRODITE_IMAGE_WORKERS` | `5` | 单番号图片并发数 |
 | `APHRODITE_MAX_ATTEMPTS` | `5` | 单图最多尝试次数 |
+| `APHRODITE_FILM_DIRS` | 空 | 影片根目录列表（逗号分隔，容器内路径），影片管理入口 |
+| `APHRODITE_FILM_PATH_MAP` | 空 | 容器路径=本机路径 映射（逗号分隔），「打开」按钮换算本机路径用 |
 | `BACKEND_ORIGIN`（仅 vite dev） | `http://127.0.0.1:8000` | dev proxy 目标 |
 
 线上限流是**全局**的（`crawler.JavBus._throttle` 加锁），调大并发不会绕过站点风控，只会让线程空等。

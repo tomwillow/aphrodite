@@ -1,7 +1,8 @@
 # Aphrodite 容器编排（Linux 部署用）
 #
-# 本文件由 scripts/config_compose.sh 交互式生成，也可以手工改：
-# 重跑脚本时，会把这里的现有值当作默认值（回车即保留），所以手工改动不会白费。
+# 本文件由 scripts/config_compose.sh 生成，也可以手工改。
+# 部署配置以项目根目录的 .env 为准（scripts/deploy.sh -i 可交互生成/更新它）；
+# 本文件里改的值会在下次按 .env 重新生成时被覆盖。
 #
 # 前置条件：本地已有镜像（先跑 scripts/build_image.sh）。
 # 启动：docker compose up -d     查看日志：docker compose logs -f
@@ -24,8 +25,11 @@ services:
       APHRODITE_TASK_WORKERS: "2"
       APHRODITE_IMAGE_WORKERS: "5"
       APHRODITE_MAX_ATTEMPTS: "5"
+      APHRODITE_FILM_DIRS: "/data/films/wandoujia"
+      APHRODITE_FILM_PATH_MAP: "~/NewDisk/wandoujia=Y:/wandoujia"
     volumes:
       - ./data:/data
+      - ~/NewDisk/wandoujia:/data/films/wandoujia
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=3).status == 200 else 1)"]
       interval: 30s

@@ -1,35 +1,60 @@
 #!/usr/bin/env bash
-# 交互式生成 / 修改 docker-compose.yml（不构建镜像、不启动容器）。
+# 生成 / 修改 docker-compose.yml（不构建镜像、不启动容器）。
 #
-# 默认值取自「现有的 docker-compose.yml」：想改哪项就覆盖哪项，其余回车保留。
-# 因为没有 docker-compose.yml 时也能跑，所以首次部署可以反复重跑这个脚本。
+# 配置来源：项目根目录的 .env（KEY=value，不入 git），其次是现有 docker-compose.yml，
+# 最后是内置默认值。默认不询问，直接按 .env/现有值写 compose；
+# 加 -i 走交互式问答，答完把全部答案回写 .env，下次部署就不用再答；
+# .env 不存在时也会自动进入交互式（传 -y 可强制跳过）。
 #
 # 用法：
-#   scripts/config_compose.sh                    # 逐项询问
-#   scripts/config_compose.sh -y                 # 全部用现有值/默认值，不问
-#   scripts/config_compose.sh --image foo:v1     # 只把镜像名改掉，其余继续询问
-#   scripts/config_compose.sh --image foo:v1 -y  # 只把镜像名改掉，其余不动
+#   scripts/config_compose.sh                    # 按 .env/现有值生成 compose，不问
+#   scripts/config_compose.sh -i                 # 交互式问答，答完写回 .env
+#   scripts/config_compose.sh --image foo:v1     # 只把镜像名改掉，其余不动
+#   scripts/config_compose.sh -y                 # 强制静默（.env 缺失也不交互）
 
 set -euo pipefail
 
 # shellcheck source=lib/common.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib/common.sh"
 
+INTERACTIVE=0
 ASSUME_YES=0
 IMAGE_OVERRIDE=""
 
+# 影片目录列表校验：空 = 不启用；每项非空且不含冒号（冒号会破坏 volume 语法）
+v_film_dirs() {
+    [ -z "$1" ] && return 0
+    local IFS=','
+    for p in $1; do
+        [ -n "$p" ] && [[ "$p" != *:* ]] || return 1
+    done
+    return 0
+}
+
+# 路径映射校验：空 = 不启用；每项必须是 容器路径=本机路径
+v_film_map() {
+    [ -z "$1" ] && return 0
+    local IFS=','
+    for p in $1; do
+        [[ "$p" == *=* ]] || return 1
+    done
+    return 0
+}
+
 usage() {
     cat <<'EOF'
-交互式生成 / 修改 docker-compose.yml
+生成 / 修改 docker-compose.yml
 
 用法: scripts/config_compose.sh [选项]
 
 选项:
-  --image <镜像名>   覆盖镜像名（仍需已构建；其余项照常询问）
-  -y, --yes          不询问，直接按现有值/默认值写回
+  --image <镜像名>   覆盖镜像名（其余项不动）
+  -i, --interactive  交互式问答，答完把全部配置写回 .env
+  -y, --yes          强制静默：.env 缺失也不进入交互式，按内置默认值生成
   -h, --help         显示本帮助
 
 说明:
+  · 配置来源：.env > 现有 docker-compose.yml > 内置默认值
   · 容器内端口固定 8000，只配置宿主端口与监听地址
   · 数据目录会挂载到容器 /data（数据库 + 图库），务必持久化
   · 写文件前会把原文件备份成 docker-compose.yml.bak
@@ -41,15 +66,22 @@ while [ $# -gt 0 ]; do
         --image)
             [ $# -ge 2 ] || die "--image 需要跟一个镜像名"
             IMAGE_OVERRIDE="$2"; shift 2 ;;
+        -i|--interactive) INTERACTIVE=1; shift ;;
         -y|--yes) ASSUME_YES=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) die "未知参数：$1（--help 查看用法）" ;;
     esac
 done
 
-# ---------- 1. 收集当前值（作为交互默认值） ----------
+# .env 缺失时自动进入交互式（-y 显式跳过）
+if [ ! -f "$ENV_FILE" ] && [ "$ASSUME_YES" -eq 0 ]; then
+    warn "未找到 .env，自动进入交互式问答（答完写回 .env；传 -y 可强制跳过）"
+    INTERACTIVE=1
+fi
 
-cur_image="$(yml_value image "$DEFAULT_IMAGE")"
+# ---------- 1. 收集当前值（.env 优先，其次现有 compose，最后内置默认值） ----------
+
+cur_image="$(env_get IMAGE "$(yml_value image "$DEFAULT_IMAGE")")"
 if [ -n "$IMAGE_OVERRIDE" ]; then
     cur_image="$IMAGE_OVERRIDE"
 fi
@@ -58,25 +90,29 @@ fi
 port_spec="$(yml_port_spec)"
 port_spec="${port_spec:-${CONTAINER_PORT}:${CONTAINER_PORT}}"
 IFS=':' read -r -a port_parts <<< "$port_spec"
-cur_bind="0.0.0.0"
-cur_port="$CONTAINER_PORT"
+yml_bind="0.0.0.0"
+yml_port="$CONTAINER_PORT"
 case "${#port_parts[@]}" in
-    1) cur_port="${port_parts[0]}" ;;
-    2) cur_port="${port_parts[0]}" ;;
-    3) cur_bind="${port_parts[0]}"; cur_port="${port_parts[1]}" ;;
+    1) yml_port="${port_parts[0]}" ;;
+    2) yml_port="${port_parts[0]}" ;;
+    3) yml_bind="${port_parts[0]}"; yml_port="${port_parts[1]}" ;;
 esac
+cur_bind="$(env_get BIND_ADDR "$yml_bind")"
+cur_port="$(env_get HOST_PORT "$yml_port")"
 
-cur_container="$(yml_value container_name "aphrodite")"
-cur_data="$(yml_data_dir)"
+cur_container="$(env_get CONTAINER_NAME "$(yml_value container_name "aphrodite")")"
+cur_data="$(env_get DATA_DIR "$(yml_data_dir)")"
 cur_data="${cur_data:-./data}"
-cur_restart="$(yml_value restart "unless-stopped")"
-cur_tz="$(yml_value TZ "Asia/Shanghai")"
-cur_javbus="$(yml_value JAVBUS_BASE "https://www.javbus.com")"
-cur_page="$(yml_value APHRODITE_PAGE_INTERVAL "1.2")"
-cur_image_int="$(yml_value APHRODITE_IMAGE_INTERVAL "0.15")"
-cur_task_workers="$(yml_value APHRODITE_TASK_WORKERS "2")"
-cur_image_workers="$(yml_value APHRODITE_IMAGE_WORKERS "5")"
-cur_max_attempts="$(yml_value APHRODITE_MAX_ATTEMPTS "5")"
+cur_restart="$(env_get RESTART "$(yml_value restart "unless-stopped")")"
+cur_tz="$(env_get TZ "$(yml_value TZ "Asia/Shanghai")")"
+cur_javbus="$(env_get JAVBUS_BASE "$(yml_value JAVBUS_BASE "https://www.javbus.com")")"
+cur_page="$(env_get PAGE_INTERVAL "$(yml_value APHRODITE_PAGE_INTERVAL "1.2")")"
+cur_image_int="$(env_get IMAGE_INTERVAL "$(yml_value APHRODITE_IMAGE_INTERVAL "0.15")")"
+cur_task_workers="$(env_get TASK_WORKERS "$(yml_value APHRODITE_TASK_WORKERS "2")")"
+cur_image_workers="$(env_get IMAGE_WORKERS "$(yml_value APHRODITE_IMAGE_WORKERS "5")")"
+cur_max_attempts="$(env_get MAX_ATTEMPTS "$(yml_value APHRODITE_MAX_ATTEMPTS "5")")"
+cur_film_dirs="$(env_get FILM_DIRS "$(yml_film_host_dirs)")"
+cur_film_map="$(env_get FILM_PATH_MAP "$(yml_value APHRODITE_FILM_PATH_MAP "")")"
 
 # ---------- 2. 交互 ----------
 
@@ -93,10 +129,12 @@ IMAGE_INTERVAL="$cur_image_int"
 TASK_WORKERS="$cur_task_workers"
 IMAGE_WORKERS="$cur_image_workers"
 MAX_ATTEMPTS="$cur_max_attempts"
+FILM_DIRS="$cur_film_dirs"
+FILM_PATH_MAP="$cur_film_map"
 
-if [ "$ASSUME_YES" -eq 0 ]; then
+if [ "$INTERACTIVE" -eq 1 ]; then
     step "配置 docker-compose.yml"
-    info "直接回车 = 保留方括号里的值（默认值来自现有 $(basename "$COMPOSE_FILE")）"
+    info "直接回车 = 保留方括号里的值；答完会把全部配置写回 .env（下次部署不再询问）"
 
     printf '\n%s— 基础 —%s\n' "$C_BOLD" "$C_END"
     IMAGE="$(ask_value "镜像名（必须已构建）" "$IMAGE" v_image)"
@@ -114,8 +152,35 @@ if [ "$ASSUME_YES" -eq 0 ]; then
     TASK_WORKERS="$(ask_value "同时执行的任务数" "$TASK_WORKERS" v_int)"
     IMAGE_WORKERS="$(ask_value "单个番号的图片并发数" "$IMAGE_WORKERS" v_int)"
     MAX_ATTEMPTS="$(ask_value "单张图片最大尝试次数" "$MAX_ATTEMPTS" v_int)"
+
+    printf '\n%s— 影片管理（不启用直接回车）—%s\n' "$C_BOLD" "$C_END"
+    info "影片目录会逐个挂载到容器 /data/films/<目录名> 下，逗号分隔可填多个"
+    FILM_DIRS="$(ask_value "影片目录（宿主机路径，逗号分隔）" "$FILM_DIRS" v_film_dirs)"
+    FILM_PATH_MAP="$(ask_value "容器→本机路径映射（打开按钮用，如 /data/films=Z:\\Films，逗号分隔）" "$FILM_PATH_MAP" v_film_map)"
+
+    env_write_back \
+        "IMAGE=$IMAGE" \
+        "CONTAINER_NAME=$CONTAINER_NAME" \
+        "BIND_ADDR=$BIND_ADDR" \
+        "HOST_PORT=$HOST_PORT" \
+        "DATA_DIR=$DATA_DIR" \
+        "RESTART=$RESTART" \
+        "TZ=$TZ_VALUE" \
+        "JAVBUS_BASE=$JAVBUS_BASE" \
+        "PAGE_INTERVAL=$PAGE_INTERVAL" \
+        "IMAGE_INTERVAL=$IMAGE_INTERVAL" \
+        "TASK_WORKERS=$TASK_WORKERS" \
+        "IMAGE_WORKERS=$IMAGE_WORKERS" \
+        "MAX_ATTEMPTS=$MAX_ATTEMPTS" \
+        "FILM_DIRS=$FILM_DIRS" \
+        "FILM_PATH_MAP=$FILM_PATH_MAP"
+    ok "配置已写回 $ENV_FILE（该文件不入 git）"
 else
-    info "已指定 -y，跳过询问，直接写回现有值"
+    if env_exists; then
+        info "配置读取自 $(basename "$ENV_FILE")（改配置可直接编辑该文件，或加 -i 交互问答）"
+    else
+        warn "未找到 .env 且已指定 -y，全部按现有 compose / 内置默认值生成"
+    fi
 fi
 
 # ---------- 3. 派生与校验 ----------
@@ -147,6 +212,42 @@ fi
 [ -w "$(dirname "$COMPOSE_FILE")" ] \
     || die "目录不可写，无法生成 $(basename "$COMPOSE_FILE")：$(dirname "$COMPOSE_FILE")"
 
+# ---------- 影片目录：宿主路径 -> 容器卷 + 环境变量 ----------
+
+FILM_VOLUME_LINES=""
+FILM_ENV_LINES=""
+if [ -n "$FILM_DIRS" ]; then
+    declare -a film_container_paths=()
+    idx=0
+    used=""
+    oldIFS="$IFS"; IFS=','
+    for host_dir in $FILM_DIRS; do
+        idx=$((idx + 1))
+        host_dir="${host_dir#"${host_dir%%[![:space:]]*}"}"   # ltrim
+        host_dir="${host_dir%"${host_dir##*[![:space:]]}"}"   # rtrim
+        [ -n "$host_dir" ] || continue
+        base="$(basename "$host_dir")"
+        base="$(printf '%s' "$base" | tr -c 'A-Za-z0-9._-' '_')"
+        base="${base:-dir$idx}"
+        # 容器内路径不重复：重名追加序号
+        container="/data/films/$base"
+        n=2
+        while printf '%s\n' "$used" | grep -qxF "$container"; do
+            container="/data/films/$base$n"
+            n=$((n + 1))
+        done
+        used="$used$container"$'\n'
+        film_container_paths+=("$container")
+        FILM_VOLUME_LINES+="      - ${host_dir}:${container}"$'\n'
+    done
+    IFS="$oldIFS"
+    joined="$(IFS=,; printf '%s' "${film_container_paths[*]}")"
+    FILM_ENV_LINES="      APHRODITE_FILM_DIRS: \"${joined}\""$'\n'
+    if [ -n "$FILM_PATH_MAP" ]; then
+        FILM_ENV_LINES+="      APHRODITE_FILM_PATH_MAP: \"${FILM_PATH_MAP}\""$'\n'
+    fi
+fi
+
 # ---------- 4. 写文件 ----------
 
 if [ -f "$COMPOSE_FILE" ]; then
@@ -157,8 +258,9 @@ fi
 cat > "$COMPOSE_FILE" <<EOF
 # Aphrodite 容器编排（Linux 部署用）
 #
-# 本文件由 scripts/config_compose.sh 交互式生成，也可以手工改：
-# 重跑脚本时，会把这里的现有值当作默认值（回车即保留），所以手工改动不会白费。
+# 本文件由 scripts/config_compose.sh 生成，也可以手工改。
+# 部署配置以项目根目录的 .env 为准（scripts/deploy.sh -i 可交互生成/更新它）；
+# 本文件里改的值会在下次按 .env 重新生成时被覆盖。
 #
 # 前置条件：本地已有镜像（先跑 scripts/build_image.sh）。
 # 启动：docker compose up -d     查看日志：docker compose logs -f
@@ -181,9 +283,9 @@ services:
       APHRODITE_TASK_WORKERS: "${TASK_WORKERS}"
       APHRODITE_IMAGE_WORKERS: "${IMAGE_WORKERS}"
       APHRODITE_MAX_ATTEMPTS: "${MAX_ATTEMPTS}"
-    volumes:
+${FILM_ENV_LINES}    volumes:
       - ${DATA_DIR}:/data
-    healthcheck:
+${FILM_VOLUME_LINES}    healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:${CONTAINER_PORT}/api/health', timeout=3).status == 200 else 1)"]
       interval: 30s
       timeout: 5s
@@ -221,5 +323,9 @@ printf '  数据目录    %s -> /data\n' "$data_abs"
 printf '  时区/重启   %s / %s\n' "$TZ_VALUE" "$RESTART"
 printf '  抓取节奏    页面 %ss，图片 %ss，任务并发 %s，图片并发 %s，最多重试 %s 次\n' \
     "$PAGE_INTERVAL" "$IMAGE_INTERVAL" "$TASK_WORKERS" "$IMAGE_WORKERS" "$MAX_ATTEMPTS"
+if [ -n "$FILM_DIRS" ]; then
+    printf '  影片目录    %s\n' "$FILM_DIRS"
+    [ -n "$FILM_PATH_MAP" ] && printf '  路径映射    %s\n' "$FILM_PATH_MAP"
+fi
 
 printf '\n下一步：%sdocker compose up -d%s\n' "$C_INFO" "$C_END"

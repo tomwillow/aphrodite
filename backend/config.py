@@ -17,6 +17,29 @@ WEB_DIST = BASE_DIR / "web" / "dist"
 
 JAVBUS_BASE = os.environ.get("JAVBUS_BASE", "https://www.javbus.com").rstrip("/")
 
+# ---------------------------------------------------------------- 影片管理
+def _split_list(value: str | None) -> list[str]:
+    """影片目录列表：逗号 / 分号分隔（不用冒号，Windows 盘符路径里含冒号）。"""
+    if not value:
+        return []
+    return [p.strip() for p in re.split(r"[;,]", value) if p.strip()]
+
+
+# 影片根目录（容器内路径），如 /data/films/a,/data/films/b
+FILM_DIRS: list[Path] = [Path(p) for p in _split_list(os.environ.get("APHRODITE_FILM_DIRS"))]
+
+# 容器路径 → 本机路径 映射，如 /data/films=Z:\Films,/data/films2=D:\Films2
+# 「打开」按钮用它把容器内路径换算成浏览器所在机器能访问的路径
+FILM_PATH_MAP: list[tuple[str, str]] = []
+for pair in _split_list(os.environ.get("APHRODITE_FILM_PATH_MAP")):
+    if "=" in pair:
+        server, local = pair.split("=", 1)
+        server, local = server.strip().rstrip("/"), local.strip().rstrip("\\/")
+        if server and local:
+            FILM_PATH_MAP.append((server, local))
+# 按 prefix 长度降序，换算时命中最长前缀
+FILM_PATH_MAP.sort(key=lambda p: len(p[0]), reverse=True)
+
 # 页面请求最小间隔（秒），避免触发站点风控
 PAGE_INTERVAL = float(os.environ.get("APHRODITE_PAGE_INTERVAL", "1.2"))
 IMAGE_INTERVAL = float(os.environ.get("APHRODITE_IMAGE_INTERVAL", "0.15"))

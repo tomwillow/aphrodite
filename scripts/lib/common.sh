@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# scripts/lib/common.sh —— 部署脚本共用的工具函数（日志、docker 探测、交互提问、yml 取值）
+# scripts/lib/common.sh —— 部署脚本共用的工具函数（日志、docker 探测、交互提问、yml 取值、.env 读写）
 # 不单独执行，由 build_image.sh / config_compose.sh / deploy.sh source。
 
 set -euo pipefail
@@ -12,6 +12,8 @@ SCRIPTS_DIR="$APHRODITE_ROOT/scripts"
 DEFAULT_IMAGE="${APHRODITE_IMAGE:-aphrodite:latest}"
 # compose 文件位置，可用环境变量 APHRODITE_COMPOSE_FILE 覆盖
 COMPOSE_FILE="${APHRODITE_COMPOSE_FILE:-$APHRODITE_ROOT/docker-compose.yml}"
+# 部署配置文件（KEY=value），可用环境变量 APHRODITE_ENV_FILE 覆盖；不入 git
+ENV_FILE="${APHRODITE_ENV_FILE:-$APHRODITE_ROOT/.env}"
 # 容器内端口固定 8000（run.py 与 compose 都按它写），只有宿主端口可改
 CONTAINER_PORT=8000
 
@@ -128,4 +130,64 @@ yml_port_spec() {
 yml_data_dir() {
     [ -f "$COMPOSE_FILE" ] || return 0
     sed -n 's/^[[:space:]]*-[[:space:]]*\(.*\):\/data$/\1/p' "$COMPOSE_FILE" | head -n1
+}
+
+# 影片目录卷的宿主机路径列表（形如 /mnt/films/a:/data/films/a），逗号连接
+yml_film_host_dirs() {
+    [ -f "$COMPOSE_FILE" ] || return 0
+    sed -n 's/^[[:space:]]*-[[:space:]]*\(.*\):\/data\/films\/.*$/\1/p' "$COMPOSE_FILE" \
+        | paste -sd,
+}
+
+# ---------- .env 部署配置（KEY=value，不入 git） ----------
+
+env_exists() { [ -f "$ENV_FILE" ]; }
+
+# env_get <KEY> [默认值]：从 .env 读 KEY=value，值两侧引号去掉
+env_get() {
+    local key="$1" default="${2-}" line=""
+    if [ -f "$ENV_FILE" ]; then
+        line="$(sed -n "s/^${key}=//p" "$ENV_FILE" | head -n1)"
+        line="${line%\"}"; line="${line#\"}"
+        line="${line%\'}"; line="${line#\'}"
+    fi
+    printf '%s' "${line:-$default}"
+}
+
+# env_write_back <KEY=value>...：把键值写回 .env
+# 保留注释与其他未知行；已有键原地更新，没有的键追加到末尾
+# 值里可以再带 =（如 FILM_PATH_MAP=/data/films=Z:\Films），按第一个 = 切分
+env_write_back() {
+    [ $# -ge 1 ] || return 0
+    local -a keys=() values=()
+    local kv key value i out="" found
+    for kv in "$@"; do
+        keys+=("${kv%%=*}")
+        values+=("${kv#*=}")
+    done
+    if [ -f "$ENV_FILE" ]; then
+        while IFS= read -r line || [ -n "$line" ]; do
+            case "$line" in
+                [A-Za-z_]*=*)
+                    key="${line%%=*}"
+                    found=0
+                    for i in "${!keys[@]}"; do
+                        if [ "${keys[$i]}" = "$key" ]; then
+                            out+="${keys[$i]}=${values[$i]}"$'\n'
+                            found=1
+                            break
+                        fi
+                    done
+                    [ "$found" -eq 1 ] || out+="$line"$'\n'
+                    ;;
+                *) out+="$line"$'\n' ;;
+            esac
+        done < "$ENV_FILE"
+    fi
+    for i in "${!keys[@]}"; do
+        if ! printf '%s' "$out" | grep -q "^${keys[$i]}="; then
+            out+="${keys[$i]}=${values[$i]}"$'\n'
+        fi
+    done
+    printf '%s' "$out" > "$ENV_FILE"
 }

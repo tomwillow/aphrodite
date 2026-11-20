@@ -10,6 +10,7 @@ import shutil
 import sqlite3
 import threading
 import time
+from pathlib import Path
 from typing import Any, Iterable
 
 from .config import DB_PATH, IMAGES_DIR, LIBRARY_DIR, ensure_dirs, safe_dir_name
@@ -111,6 +112,32 @@ CREATE TABLE IF NOT EXISTS removals (
     rev         INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_removals_task ON removals(task_id, rev);
+
+-- 影片管理：影片根目录（来自 APHRODITE_FILM_DIRS，启动时同步）
+CREATE TABLE IF NOT EXISTS film_dirs (
+    id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    path    TEXT    NOT NULL UNIQUE,
+    label   TEXT    NOT NULL,
+    valid   INTEGER NOT NULL DEFAULT 1
+);
+
+-- 影片管理：文件条目，只存文件夹与视频文件（缩略图等附属文件不入库）
+CREATE TABLE IF NOT EXISTS film_entries (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    dir_id     INTEGER NOT NULL,
+    parent_rel TEXT    NOT NULL DEFAULT '',  -- 所在目录的 posix 相对路径，'' 表示根级
+    rel_path   TEXT    NOT NULL,             -- 自身 posix 相对路径（含文件名）
+    name       TEXT    NOT NULL,
+    is_dir     INTEGER NOT NULL DEFAULT 0,
+    size       INTEGER NOT NULL DEFAULT 0,
+    mtime      REAL    NOT NULL DEFAULT 0,
+    code       TEXT,                         -- 从文件名提取的番号
+    thumb_rel  TEXT,                         -- 同目录同名缩略图的相对路径
+    rev        INTEGER NOT NULL DEFAULT 0,
+    created_at REAL    NOT NULL,
+    UNIQUE(dir_id, rel_path)
+);
+CREATE INDEX IF NOT EXISTS idx_film_entries_level ON film_entries(dir_id, parent_rel);
 """
 
 
@@ -432,6 +459,157 @@ def reset_for_retry(task_id: int) -> int:
         )
         c.commit()
     return reset_images
+
+
+# ---------------------------------------------------------------- 影片管理
+
+def film_sync_dirs(paths: list[str]) -> list[dict[str, Any]]:
+    """把环境变量里的影片目录同步进 film_dirs：新路径插入，消失的路径标记失效。"""
+    with _write_lock, conn() as c:
+        existing = {r["path"]: r for r in c.execute("SELECT * FROM film_dirs").fetchall()}
+        for p in paths:
+            norm = p.rstrip("/\\")
+            if norm in existing:
+                if existing[norm]["valid"] != 1:
+                    c.execute("UPDATE film_dirs SET valid=1 WHERE path=?", (norm,))
+            else:
+                c.execute(
+                    "INSERT INTO film_dirs(path, label) VALUES(?,?)",
+                    (norm, Path(norm).name or norm),
+                )
+        known = {p.rstrip("/\\") for p in paths}
+        for p in existing:
+            if p not in known:
+                c.execute("UPDATE film_dirs SET valid=0 WHERE path=?", (p,))
+        c.commit()
+    return film_list_dirs()
+
+
+def film_list_dirs() -> list[dict[str, Any]]:
+    rows = conn().execute("SELECT * FROM film_dirs ORDER BY id").fetchall()
+    return [dict(r) for r in rows]
+
+
+def film_get_dir(dir_id: int) -> dict[str, Any] | None:
+    return _row(conn().execute("SELECT * FROM film_dirs WHERE id=?", (dir_id,)).fetchone())
+
+
+def film_set_dir_valid(dir_id: int, valid: int) -> None:
+    with _write_lock, conn() as c:
+        c.execute("UPDATE film_dirs SET valid=? WHERE id=?", (valid, dir_id))
+        c.commit()
+
+
+def film_get_entry(entry_id: int) -> dict[str, Any] | None:
+    return _row(conn().execute("SELECT * FROM film_entries WHERE id=?", (entry_id,)).fetchone())
+
+
+def film_list_level(dir_id: int, parent_rel: str) -> list[dict[str, Any]]:
+    rows = conn().execute(
+        "SELECT * FROM film_entries WHERE dir_id=? AND parent_rel=?"
+        " ORDER BY is_dir DESC, name COLLATE NOCASE",
+        (dir_id, parent_rel),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def film_replace_level(
+    dir_id: int, parent_rel: str, rows: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """把磁盘扫描结果与该级 DB 行 diff：新增插入、消失删除、变化更新。
+
+    rows 由 films.scan_level() 产出：[{rel_path, name, is_dir, size, mtime, code, thumb_rel}]。
+    返回该级最新的 DB 行（与 film_list_level 同序）。
+    """
+    now = time.time()
+    with _write_lock, conn() as c:
+        current = {
+            r["rel_path"]: r
+            for r in c.execute(
+                "SELECT * FROM film_entries WHERE dir_id=? AND parent_rel=?",
+                (dir_id, parent_rel),
+            ).fetchall()
+        }
+        disk = {r["rel_path"]: r for r in rows}
+        for rel in current:
+            if rel not in disk:
+                c.execute(
+                    "DELETE FROM film_entries WHERE id=?",
+                    (int(current[rel]["id"]),),
+                )
+        for rel, row in disk.items():
+            old = current.get(rel)
+            if old is None:
+                c.execute(
+                    "INSERT INTO film_entries(dir_id, parent_rel, rel_path, name, is_dir,"
+                    " size, mtime, code, thumb_rel, rev, created_at)"
+                    " VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        dir_id,
+                        parent_rel,
+                        rel,
+                        row["name"],
+                        row["is_dir"],
+                        row["size"],
+                        row["mtime"],
+                        row["code"],
+                        row["thumb_rel"],
+                        next_rev(),
+                        now,
+                    ),
+                )
+            elif (
+                old["name"] != row["name"]
+                or old["size"] != row["size"]
+                or old["mtime"] != row["mtime"]
+                or old["code"] != row["code"]
+                or old["thumb_rel"] != row["thumb_rel"]
+            ):
+                c.execute(
+                    "UPDATE film_entries SET name=?, size=?, mtime=?, code=?, thumb_rel=?, rev=?"
+                    " WHERE id=?",
+                    (
+                        row["name"],
+                        row["size"],
+                        row["mtime"],
+                        row["code"],
+                        row["thumb_rel"],
+                        next_rev(),
+                        int(old["id"]),
+                    ),
+                )
+        c.commit()
+    return film_list_level(dir_id, parent_rel)
+
+
+def film_rename_entry(entry_id: int, rel_path: str, name: str, code: str | None,
+                      thumb_rel: str | None, mtime: float, size: int) -> None:
+    with _write_lock, conn() as c:
+        c.execute(
+            "UPDATE film_entries SET rel_path=?, name=?, code=?, thumb_rel=?, mtime=?, size=?, rev=?"
+            " WHERE id=?",
+            (rel_path, name, code, thumb_rel, mtime, size, next_rev(), entry_id),
+        )
+        c.commit()
+
+
+def film_delete_entry(entry_id: int) -> None:
+    with _write_lock, conn() as c:
+        c.execute("DELETE FROM film_entries WHERE id=?", (entry_id,))
+        c.commit()
+
+
+def film_delete_subtree(dir_id: int, rel_path: str) -> int:
+    """删掉条目本身及其所有后代行（目录被删除时清理残留），返回删除的行数。"""
+    prefix = rel_path + "/"
+    with _write_lock, conn() as c:
+        cur = c.execute(
+            "DELETE FROM film_entries WHERE dir_id=? AND (rel_path=? OR rel_path LIKE ?)",
+            (dir_id, rel_path, prefix + "%"),
+        )
+        n = cur.rowcount
+        c.commit()
+    return n
 
 
 # ---------------------------------------------------------------- 统一图库

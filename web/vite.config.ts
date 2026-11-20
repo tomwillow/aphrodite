@@ -9,7 +9,8 @@ export default defineConfig({
     port: 5173,
     proxy: {
       '/api': { target: backend, changeOrigin: true },
-      '/media': { target: backend, changeOrigin: true }
+      '/media': { target: backend, changeOrigin: true },
+      '/film-media': { target: backend, changeOrigin: true }
     }
   },
   build: {

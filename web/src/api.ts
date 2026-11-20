@@ -48,6 +48,41 @@ export interface TaskSnapshot {
   images: TaskImage[]
 }
 
+export interface FilmDir {
+  id: number
+  path: string
+  label: string
+  valid: number
+}
+
+export interface FilmEntry {
+  id: number
+  name: string
+  rel_path: string
+  parent_rel: string
+  is_dir: boolean
+  size: number
+  mtime: number
+  code: string | null
+  thumb_rel: string | null
+  local_path: string | null
+  /** 仅文件夹：子级视频数与拼贴缩略图（相对根目录的路径） */
+  video_count?: number
+  collage?: string[]
+}
+
+export interface FilmEntriesResp {
+  dir: FilmDir
+  path: string
+  entries: FilmEntry[]
+}
+
+export interface FilmHandler {
+  bat: string
+  ps1: string
+  readme: string
+}
+
 async function parse<T>(res: Response): Promise<T> {
   if (!res.ok) {
     let detail = res.statusText
@@ -104,4 +139,49 @@ export async function retryTask(
 
 export function mediaUrl(path: string): string {
   return `/media/${path.split('/').map(encodeURIComponent).join('/')}`
+}
+
+// ---------------------------------------------------------------- 影片管理
+
+export async function fetchFilmDirs(): Promise<{ dirs: FilmDir[]; mapped: boolean }> {
+  const res = await fetch('/api/films/dirs')
+  return parse(res)
+}
+
+export async function fetchFilmEntries(dirId: number | string, path: string): Promise<FilmEntriesResp> {
+  const q = `dir_id=${encodeURIComponent(dirId)}&path=${encodeURIComponent(path)}`
+  const res = await fetch(`/api/films/entries?${q}`)
+  return parse<FilmEntriesResp>(res)
+}
+
+export async function renameFilmEntry(entryId: number, newName: string): Promise<void> {
+  const res = await fetch('/api/films/rename', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ entry_id: entryId, new_name: newName })
+  })
+  await parse<{ ok: boolean }>(res)
+}
+
+export async function deleteFilmEntry(entryId: number): Promise<void> {
+  const res = await fetch('/api/films/delete', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ entry_id: entryId })
+  })
+  await parse<{ ok: boolean }>(res)
+}
+
+export async function fetchFilmHandler(): Promise<FilmHandler> {
+  const res = await fetch('/api/films/handler')
+  return parse<FilmHandler>(res)
+}
+
+export function filmMediaUrl(dirId: number | string, relPath: string): string {
+  return `/film-media/${dirId}/${relPath.split('/').map(encodeURIComponent).join('/')}`
+}
+
+/** 本机播放路径 → aphrodite-play:// 协议地址（统一正斜杠，bat 处理器可直接 start） */
+export function playUrl(localPath: string): string {
+  return `aphrodite-play://${localPath.replace(/\\/g, '/')}`
 }

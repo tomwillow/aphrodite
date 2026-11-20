@@ -8,3 +8,5 @@ web/dist/
 .DS_Store
 # config_compose.sh 每次写文件前的备份
 docker-compose.yml.bak
+# 部署配置（deploy.sh -i 生成，含本机路径等私有信息）
+.env

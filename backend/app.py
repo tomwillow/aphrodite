@@ -5,6 +5,7 @@ import asyncio
 import json
 import time
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any, AsyncIterator
 
 from fastapi import FastAPI, HTTPException, Request
@@ -12,9 +13,9 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import db
+from . import db, films
 from .codes import parse_text
-from .config import IMAGES_DIR, WEB_DIST, ensure_dirs
+from .config import FILM_DIRS, FILM_PATH_MAP, IMAGES_DIR, WEB_DIST, ensure_dirs
 from .worker import runner
 
 
@@ -40,6 +41,15 @@ class CreateTaskIn(BaseModel):
 
 class ParseIn(BaseModel):
     text: str = ""
+
+
+class FilmRenameIn(BaseModel):
+    entry_id: int
+    new_name: str = ""
+
+
+class FilmDeleteIn(BaseModel):
+    entry_id: int
 
 
 @app.get("/api/health")
@@ -172,6 +182,79 @@ async def api_stream(task_id: int, request: Request, rev: int = 0) -> StreamingR
 
 def _sse(event: str, data: Any) -> bytes:
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n".encode("utf-8")
+
+
+# ---------------------------------------------------------------- 影片管理
+
+def _film_error(e: FilmError) -> HTTPException:
+    return HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/api/films/dirs")
+def api_film_dirs() -> dict[str, Any]:
+    dirs = db.film_sync_dirs([str(p) for p in FILM_DIRS])
+    return {"dirs": dirs, "mapped": bool(FILM_PATH_MAP or films.FILM_PATH_MAP)}
+
+
+@app.get("/api/films/entries")
+def api_film_entries(dir_id: int, path: str = "") -> dict[str, Any]:
+    d = db.film_get_dir(dir_id)
+    if not d:
+        raise HTTPException(status_code=404, detail="影片目录不存在")
+    if not d["valid"]:
+        raise HTTPException(status_code=400, detail=f"影片目录不可访问：{d['path']}")
+    try:
+        entries = films.scan_and_sync(dir_id, path)
+    except films.FilmError as e:
+        raise _film_error(e)
+    return {
+        "dir": d,
+        "path": films._norm_rel(path),
+        "entries": entries,
+    }
+
+
+@app.post("/api/films/rename")
+def api_film_rename(payload: FilmRenameIn) -> dict[str, Any]:
+    try:
+        return films.rename_entry(payload.entry_id, payload.new_name)
+    except films.FilmError as e:
+        raise _film_error(e)
+
+
+@app.post("/api/films/delete")
+def api_film_delete(payload: FilmDeleteIn) -> dict[str, Any]:
+    try:
+        films.delete_entry(payload.entry_id)
+    except films.FilmError as e:
+        raise _film_error(e)
+    return {"ok": True}
+
+
+@app.get("/api/films/handler")
+def api_film_handler() -> dict[str, str]:
+    """本机播放协议处理器的脚本内容，供安装提示浮层下载/复制。"""
+    return {
+        "bat": films.HANDLER_BAT,
+        "ps1": films.HANDLER_INSTALL_PS1,
+        "readme": films.HANDLER_README,
+    }
+
+
+@app.get("/film-media/{dir_id}/{rel_path:path}")
+def film_media(dir_id: int, rel_path: str) -> FileResponse:
+    """影片缩略图静态服务：路径必须在影片根目录白名单之下。"""
+    d = db.film_get_dir(dir_id)
+    if not d:
+        raise HTTPException(status_code=404, detail="影片目录不存在")
+    try:
+        target = films.resolve_under_root(Path(d["path"]), films._norm_rel(rel_path))
+    except films.FilmError as e:
+        raise _film_error(e)
+    if not target.is_file():
+        raise HTTPException(status_code=404, detail="文件不存在")
+    return FileResponse(target)
+
 
 
 # ---------------------------------------------------------------- 前端
