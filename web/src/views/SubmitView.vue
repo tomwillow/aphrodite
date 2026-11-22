@@ -337,4 +337,29 @@ textarea::placeholder {
   font-family: var(--mono);
   font-size: 11.5px;
 }
+
+/* ---------------------------------------------------------------- 窄屏 */
+@media (max-width: 760px) {
+  textarea {
+    padding: 12px 14px;
+    font-size: 12.5px;
+    min-height: 150px;
+  }
+
+  .bar {
+    flex-wrap: wrap;
+    gap: 10px;
+    padding: 10px 14px;
+  }
+
+  .bar-actions {
+    margin-left: 0;
+    width: 100%;
+    justify-content: flex-end;
+  }
+
+  .problem-card li {
+    padding: 6px 12px;
+  }
+}
 </style>

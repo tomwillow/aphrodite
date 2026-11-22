@@ -198,4 +198,37 @@ describe('FilmCard', () => {
     expect(w.find('img').exists()).toBe(false)
     expect(w.find('.thumb-empty').exists()).toBe(true)
   })
+  it('点文件缩略图发出 preview（不再触发 navigate）', async () => {
+    const w = mountCard(entry())
+    await w.find('.thumb-wrap').trigger('click')
+    expect(w.emitted('preview')).toBeTruthy()
+    expect(w.emitted('navigate')).toBeFalsy()
+  })
+
+  it('扩展名徽章：文件右下角常驻大写扩展名，文件夹不显示', () => {
+    const video = mountCard(entry())
+    expect(video.find('.ext-badge').text()).toBe('MP4')
+    const image = mountCard(
+      entry({
+        name: 'cover.JPG',
+        rel_path: 'cover.JPG',
+        code: null,
+        thumb_rel: 'cover.JPG',
+        kind: 'image'
+      })
+    )
+    expect(image.find('.ext-badge').text()).toBe('JPG')
+    const folder = mountCard(
+      entry({
+        name: 'folderA',
+        rel_path: 'folderA',
+        is_dir: true,
+        code: null,
+        thumb_rel: null,
+        video_count: 1,
+        collage: ['folderA/movie.jpg']
+      })
+    )
+    expect(folder.find('.ext-badge').exists()).toBe(false)
+  })
 })

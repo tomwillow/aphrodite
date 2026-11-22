@@ -89,15 +89,22 @@ afterEach(() => {
   vi.unstubAllGlobals()
 })
 
-async function mountView(query: Record<string, string> = {}) {
+async function mountViewWithRouter(query: Record<string, string> = {}) {
   const router = createRouter({
     history: createMemoryHistory(),
     routes: [{ path: '/', component: LibraryView }]
   })
   await router.push({ path: '/', query })
   await router.isReady()
-  const wrapper = mount(LibraryView, { global: { plugins: [router] } })
+  const wrapper = mount(LibraryView, {
+    global: { plugins: [router], stubs: { teleport: true } }
+  })
   await flushPromises()
+  return { wrapper, router }
+}
+
+async function mountView(query: Record<string, string> = {}) {
+  const { wrapper } = await mountViewWithRouter(query)
   return wrapper
 }
 
@@ -110,6 +117,39 @@ describe('LibraryView', () => {
     expect(wrapper.text()).toContain('IPX-528.mp4')
     expect(FakeEventSource.instances.length).toBe(1)
     expect(FakeEventSource.instances[0].url).toBe('/api/films/stream')
+  })
+
+  it('当前目录写进 URL：进子目录后刷新仍能恢复到同一级', async () => {
+    fetchMock.mockImplementation(async (url: string) => {
+      if (url === '/api/films/dirs') return jsonRes({ dirs: [DIR_A], mapped: true })
+      if (url.startsWith('/api/films/entries')) {
+        const inFolder = String(url).includes('path=folderA')
+        return jsonRes(entriesResp(inFolder ? [videoEntry()] : [folderEntry()]))
+      }
+      return jsonRes({ detail: 'Not Found' }, 404)
+    })
+
+    const { wrapper, router } = await mountViewWithRouter()
+    // 默认选中第一个目录时就把 dir 写进 URL
+    expect(router.currentRoute.value.query).toEqual({ dir: '1' })
+
+    // 点文件夹卡片进子目录
+    await wrapper.find('.film-card .thumb-wrap').trigger('click')
+    await flushPromises()
+    expect(router.currentRoute.value.query).toEqual({ dir: '1', path: 'folderA' })
+    expect(wrapper.text()).toContain('IPX-528.mp4')
+
+    // 模拟刷新：带着同一份 URL 重新挂载，应直接停在该级
+    const again = await mountViewWithRouter({ dir: '1', path: 'folderA' })
+    expect(again.wrapper.text()).toContain('IPX-528.mp4')
+    const calls = fetchMock.mock.calls.filter(([u]) =>
+      String(u).startsWith('/api/films/entries')
+    )
+    expect(String(calls[calls.length - 1][0])).toContain('path=folderA')
+    expect(again.wrapper.find('.crumbs').text()).toContain('folderA')
+
+    again.wrapper.unmount()
+    wrapper.unmount()
   })
 
   it('深链 ?dir&path&pick：选中指定目录并高亮 pick 条目', async () => {
@@ -225,5 +265,73 @@ describe('LibraryView', () => {
     const wrapper = await mountView()
     await wrapper.find('.film-card .actions .btn').trigger('click')
     expect(wrapper.find('.err').text()).toContain('APHRODITE_FILM_PATH_MAP')
+  })
+
+  it('点图片文件打开画册：从它开始、可翻到下一张，空白处关闭', async () => {
+    fetchMock.mockImplementation(async (url: string) => {
+      if (url === '/api/films/dirs') return jsonRes({ dirs: [DIR_A], mapped: true })
+      if (url.startsWith('/api/films/entries')) {
+        return jsonRes(
+          entriesResp([
+            videoEntry({ id: 12, name: 'ABC-1.jpg', rel_path: 'ABC-1.jpg', code: null,
+              thumb_rel: 'ABC-1.jpg', kind: 'image', local_path: null }),
+            videoEntry({ id: 13, name: 'poster.png', rel_path: 'poster.png', code: null,
+              thumb_rel: 'poster.png', kind: 'image', local_path: null })
+          ])
+        )
+      }
+      return jsonRes({ detail: 'Not Found' }, 404)
+    })
+    const wrapper = await mountView()
+    const cards = wrapper.findAll('.film-card')
+    await cards[0].find('.thumb-wrap').trigger('click') // ABC-1.jpg（画册第 1 张）
+
+    const lb = wrapper.find('.lightbox')
+    expect(lb.exists()).toBe(true)
+    expect(lb.find('.viewport img').attributes('src')).toBe('/film-media/1/ABC-1.jpg')
+    expect(lb.find('.counter').text()).toBe('1 / 2')
+
+    await lb.find('.nav.next').trigger('click')
+    expect(wrapper.find('.viewport img').attributes('src')).toBe('/film-media/1/poster.png')
+    expect(wrapper.find('.counter').text()).toBe('2 / 2')
+
+    await wrapper.find('.nav.next').trigger('click') // 到头
+    expect(wrapper.find('.toast').text()).toBe('已经是最后一张')
+    expect(wrapper.find('.viewport img').attributes('src')).toBe('/film-media/1/poster.png')
+
+    await wrapper.find('.viewport').trigger('click') // 空白区域
+    expect(wrapper.find('.lightbox').exists()).toBe(false)
+  })
+
+  it('点视频缩略图定位到同名图片；无同名缩略图时不打开', async () => {
+    fetchMock.mockImplementation(async (url: string) => {
+      if (url === '/api/films/dirs') return jsonRes({ dirs: [DIR_A], mapped: true })
+      if (url.startsWith('/api/films/entries')) {
+        return jsonRes(
+          entriesResp([
+            videoEntry({ id: 10 }), // IPX-528.mp4，同名 jpg 存在
+            videoEntry({ id: 11, name: 'IPX-528.jpg', rel_path: 'IPX-528.jpg', code: null,
+              thumb_rel: 'IPX-528.jpg', kind: 'image', local_path: null }),
+            videoEntry({ id: 14, name: 'nothumb.mp4', rel_path: 'nothumb.mp4', code: null,
+              thumb_rel: null, kind: 'video', local_path: null })
+          ])
+        )
+      }
+      return jsonRes({ detail: 'Not Found' }, 404)
+    })
+    const wrapper = await mountView()
+    const cards = wrapper.findAll('.film-card')
+
+    await cards[0].find('.thumb-wrap').trigger('click')
+    const lb = wrapper.find('.lightbox')
+    expect(lb.exists()).toBe(true)
+    expect(lb.find('.viewport img').attributes('src')).toBe('/film-media/1/IPX-528.jpg')
+    expect(lb.find('.caption').text()).toBe('IPX-528.jpg')
+    await wrapper.find('.viewport').trigger('click')
+    expect(wrapper.find('.lightbox').exists()).toBe(false)
+
+    // 没有同名缩略图的视频：点击缩略图不打开播放器
+    await cards[2].find('.thumb-wrap').trigger('click')
+    expect(wrapper.find('.lightbox').exists()).toBe(false)
   })
 })

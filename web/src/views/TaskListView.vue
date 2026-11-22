@@ -360,4 +360,68 @@ function progressPct(t: Task) {
   opacity: 1;
   color: var(--accent);
 }
+
+/* ---------------------------------------------------------------- 窄屏 */
+@media (max-width: 760px) {
+  .page-head {
+    align-items: flex-start;
+    gap: 12px;
+    flex-wrap: wrap;
+  }
+
+  /* 五列网格在手机上会挤成一条，改成三行卡片式 */
+  .row {
+    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-areas:
+      'id time'
+      'main main'
+      'actions actions';
+    gap: 8px 12px;
+    padding: 12px 14px;
+  }
+
+  .col-id {
+    grid-area: id;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .kind-badge {
+    margin-top: 0;
+  }
+
+  .col-main {
+    grid-area: main;
+  }
+
+  .col-time {
+    grid-area: time;
+    align-self: center;
+  }
+
+  .col-actions {
+    grid-area: actions;
+    justify-content: flex-start;
+  }
+
+  .col-go {
+    display: none;
+  }
+
+  /* 触摸设备没有 hover，操作按钮直接常显 */
+  .del {
+    opacity: 1;
+    height: 30px;
+  }
+
+  .main-line {
+    flex-wrap: wrap;
+  }
+
+  .task-label {
+    white-space: normal;
+    word-break: break-all;
+  }
+}
 </style>

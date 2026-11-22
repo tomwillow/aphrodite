@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
-import Lightbox from '../components/Lightbox.vue'
+import Lightbox, { type LightboxImage } from '../components/Lightbox.vue'
 import {
   deleteTaskItem,
   fetchTask,
@@ -42,7 +42,7 @@ const error = ref('')
 const finished = ref(false)
 const retrying = ref(false)
 const retryHint = ref('')
-const lightbox = ref<{ src: string; caption: string } | null>(null)
+const lightbox = ref<{ images: LightboxImage[]; start: number } | null>(null)
 const deletingItem = ref<number | null>(null)
 const copyState = ref<{ id: number; ok: boolean } | null>(null)
 
@@ -234,10 +234,16 @@ onBeforeUnmount(() => {
 
 function openImage(img: TaskImage, item: TaskItem) {
   if (!img.path) return
-  lightbox.value = {
-    src: mediaUrl(img.path),
-    caption: `${item.code} · ${img.kind === 'cover' ? '主图' : `详情 ${img.seq}`}`
-  }
+  const list = (imagesByItem.get(item.id) ?? []).filter((i) => i.status === 'done' && i.path)
+  const images: LightboxImage[] = list.map((i) => ({
+    src: mediaUrl(i.path!),
+    caption: `${item.code} · ${i.kind === 'cover' ? '主图' : `详情 ${i.seq}`}`
+  }))
+  const start = Math.max(
+    list.findIndex((i) => i.id === img.id),
+    0
+  )
+  lightbox.value = { images, start }
 }
 
 async function retryFailed() {
@@ -546,8 +552,8 @@ function isHttpLink(link: string) {
 
     <Lightbox
       v-if="lightbox"
-      :src="lightbox.src"
-      :caption="lightbox.caption"
+      :images="lightbox.images"
+      :start="lightbox.start"
       @close="lightbox = null"
     />
   </section>
@@ -936,6 +942,80 @@ figcaption {
 @keyframes spin {
   to {
     transform: rotate(360deg);
+  }
+}
+
+/* ---------------------------------------------------------------- 窄屏 */
+@media (max-width: 760px) {
+  .page-head {
+    flex-wrap: wrap;
+    gap: 12px;
+    align-items: flex-start;
+  }
+
+  .head-actions {
+    width: 100%;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+
+  .sticky-progress {
+    top: 52px;
+    margin-bottom: 12px;
+  }
+
+  /* 番号行：第一行番号+状态+操作，标题单独占一行 */
+  .code-head {
+    flex-wrap: wrap;
+    gap: 6px 8px;
+    padding: 10px 12px;
+  }
+
+  .title {
+    order: 9;
+    flex: 1 1 100%;
+    white-space: normal;
+    max-height: 2.9em;
+    overflow: hidden;
+  }
+
+  .item-err {
+    flex: 1 1 100%;
+  }
+
+  .strip {
+    padding: 10px 12px 8px;
+  }
+
+  /* 下载链接：链接本体换行占满，复制按钮留在右上 */
+  .link-row {
+    flex-wrap: wrap;
+    gap: 6px 10px;
+    padding: 8px 12px 10px;
+  }
+
+  .link-text {
+    order: 3;
+    flex: 1 1 100%;
+  }
+
+  .copy {
+    margin-left: auto;
+  }
+
+  /* 影片任务条目：目标路径换行，去掉「查看」提示 */
+  .film-row {
+    flex-wrap: wrap;
+    padding: 9px 12px;
+  }
+
+  .film-target {
+    flex: 1 1 100%;
+    order: 4;
+  }
+
+  .film-jump {
+    display: none;
   }
 }
 </style>

@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
-import { useRoute } from 'vue-router'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 import {
   deleteFilmEntry,
   fetchFilmDirs,
@@ -15,6 +15,8 @@ import {
 import FilmCard from '../components/FilmCard.vue'
 import FilmTree from '../components/FilmTree.vue'
 import FilmToolDialog from '../components/FilmToolDialog.vue'
+import Lightbox, { type LightboxImage } from '../components/Lightbox.vue'
+import { filmMediaUrl } from '../api'
 
 // ---------------------------------------------------------------- 视图切换
 type ViewMode = 'dirs' | 'category'
@@ -42,8 +44,17 @@ function pickMode(m: ViewMode) {
   switcherOpen.value = false
 }
 
+// 窄屏：目录树收进左侧抽屉，点条目后自动收起
+const treeOpen = ref(false)
+
+async function onTreeSelect(dirId: number, path: string) {
+  treeOpen.value = false
+  await selectDir(dirId, path)
+}
+
 // ---------------------------------------------------------------- 数据
 const route = useRoute()
+const router = useRouter()
 const dirs = ref<FilmDir[]>([])
 const mapped = ref(false)
 const currentDirId = ref<number | null>(null)
@@ -132,10 +143,45 @@ onMounted(async () => {
 })
 
 async function selectDir(dirId: number, path: string) {
+  const changed = dirId !== currentDirId.value || path !== currentPath.value
+  await applyDir(dirId, path)
+  syncQuery()
+  // 换目录后回到顶部（手机上尤其重要，否则进来还停在上一级的滚动位置）
+  if (changed && typeof window.scrollTo === 'function') window.scrollTo({ top: 0 })
+}
+
+/** 只改状态 + 拉数据，不动 URL（供 query 监听复用，避免自己触发自己）。 */
+async function applyDir(dirId: number, path: string) {
   currentDirId.value = dirId
   currentPath.value = path
   await reload()
 }
+
+/**
+ * 把当前目录写进 URL（?dir=<dirId>&path=<rel>），刷新 / 直接打开链接都还能停在原位。
+ * 顺带丢掉一次性的 ?pick=（深链高亮只在进入时生效）。
+ */
+function syncQuery() {
+  if (currentDirId.value === null) return
+  const query: Record<string, string> = { dir: String(currentDirId.value) }
+  if (currentPath.value) query.path = currentPath.value
+  const curPath = typeof route.query.path === 'string' ? route.query.path : ''
+  const curPick = typeof route.query.pick === 'string' ? route.query.pick : ''
+  if (route.query.dir === query.dir && curPath === (query.path ?? '') && !curPick) return
+  void router.replace({ query })
+}
+
+// 浏览器前进 / 后退时跟着 URL 换目录
+watch(
+  () => [route.query.dir, route.query.path] as const,
+  ([qd, qp]) => {
+    const id = Number(qd)
+    if (!id || !dirs.value.some((d) => d.id === id)) return
+    const path = typeof qp === 'string' ? qp : ''
+    if (id === currentDirId.value && path === currentPath.value) return
+    void applyDir(id, path)
+  }
+)
 
 /** 高亮 ?pick= 指定的条目并滚动到可见（任务详情跳转用）。 */
 async function focusPick() {
@@ -245,6 +291,38 @@ async function copyText(text: string) {
   await navigator.clipboard.writeText(text)
 }
 
+// ---------------------------------------------------------------- 图片播放器
+// 画册 = 当前目录这一级的图片文件（后端已按名字排序）；点视频缩略图定位到它的
+// 同名 jpg（同名缩略图规则保证它就是目录里的图片文件，不会重复出现）。
+const viewer = ref<{ images: LightboxImage[]; start: number } | null>(null)
+
+function openPreview(entry: FilmEntry) {
+  if (currentDirId.value === null) return
+  const kind = entry.kind ?? 'video'
+  if (kind === 'image') {
+    openGallery(entry.rel_path)
+    return
+  }
+  if (entry.thumb_rel) {
+    openGallery(entry.thumb_rel)
+  }
+  // 视频没有同名缩略图（thumb_rel 为空）时没有可预览的图，不响应
+}
+
+function openGallery(locateRel: string) {
+  const gallery = entries.value.filter((e) => (e.kind ?? '') === 'image')
+  if (!gallery.length) return
+  const images: LightboxImage[] = gallery.map((e) => ({
+    src: filmMediaUrl(currentDirId.value!, e.rel_path),
+    caption: e.name
+  }))
+  const start = Math.max(
+    gallery.findIndex((e) => e.rel_path === locateRel),
+    0
+  )
+  viewer.value = { images, start }
+}
+
 // ---------------------------------------------------------------- 重命名 / 删除
 const renaming = ref<FilmEntry | null>(null)
 const renameName = ref('')
@@ -350,17 +428,20 @@ async function doDelete() {
     <div v-if="mode === 'category'" class="card empty">分类视图开发中，敬请期待。</div>
 
     <div v-else class="films-body">
-      <FilmTree
-        :dirs="dirs"
-        :current-dir-id="currentDirId"
-        :current-path="currentPath"
-        :refresh-tick="refreshTick"
-        :scan-event="scanEvent"
-        @select="selectDir"
-      />
+      <div class="tree-drawer" :class="{ open: treeOpen }" @click.self="treeOpen = false">
+        <FilmTree
+          :dirs="dirs"
+          :current-dir-id="currentDirId"
+          :current-path="currentPath"
+          :refresh-tick="refreshTick"
+          :scan-event="scanEvent"
+          @select="onTreeSelect"
+        />
+      </div>
 
       <div class="films-main">
         <div class="crumbs-bar">
+          <button class="btn btn-sm ghost tree-btn" @click="treeOpen = true">☰ 目录</button>
           <nav v-if="currentDir" class="crumbs">
             <button class="crumb" @click="selectDir(currentDir.id, '')">
               📁 {{ currentDir.label || currentDir.path }}
@@ -404,6 +485,7 @@ async function doDelete() {
             :data-name="e.name"
             @navigate="selectDir(currentDirId!, $event.rel_path)"
             @open="openEntry"
+            @preview="openPreview"
             @rename="startRename"
             @delete="startDelete"
           />
@@ -470,6 +552,8 @@ async function doDelete() {
         </div>
       </div>
     </div>
+    <!-- 图片播放器（画册） -->
+    <Lightbox v-if="viewer" :images="viewer.images" :start="viewer.start" @close="viewer = null" />
   </section>
 </template>
 
@@ -478,6 +562,16 @@ async function doDelete() {
   display: flex;
   gap: 18px;
   align-items: flex-start;
+}
+
+/* 目录树容器：宽屏是普通侧栏；窄屏变成抽屉（见 media query） */
+.tree-drawer {
+  flex: 0 0 auto;
+  min-width: 0;
+}
+
+.tree-btn {
+  display: none;
 }
 
 .films-main {
@@ -620,7 +714,7 @@ async function doDelete() {
 /* 网格 */
 .grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(230px, 1fr));
   gap: 14px;
 }
 
@@ -719,5 +813,85 @@ async function doDelete() {
   word-break: break-all;
   max-height: 180px;
   overflow-y: auto;
+}
+
+/* ---------------------------------------------------------------- 窄屏 */
+@media (max-width: 860px) {
+  .films-head {
+    flex-direction: column;
+    gap: 10px;
+    margin-bottom: 14px;
+  }
+
+  .head-actions {
+    width: 100%;
+    justify-content: flex-end;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+
+  .films-body {
+    flex-direction: column;
+    gap: 12px;
+  }
+
+  .films-main {
+    width: 100%;
+  }
+
+  /* 目录树收进抽屉：默认隐藏，点「☰ 目录」滑出，点遮罩或条目收起 */
+  .tree-btn {
+    display: inline-flex;
+  }
+
+  .tree-drawer {
+    display: none;
+  }
+
+  .tree-drawer.open {
+    display: block;
+    position: fixed;
+    inset: 0;
+    z-index: 90;
+    background: rgba(15, 18, 28, 0.42);
+  }
+
+  .tree-drawer :deep(.film-tree) {
+    position: absolute;
+    top: 0;
+    left: 0;
+    bottom: 0;
+    width: min(320px, 86vw);
+    max-height: none;
+    border-radius: 0 12px 12px 0;
+    box-shadow: 0 12px 40px rgba(16, 22, 40, 0.22);
+    padding: 12px 10px calc(12px + env(safe-area-inset-bottom));
+  }
+
+  .grid {
+    grid-template-columns: repeat(auto-fill, minmax(148px, 1fr));
+    gap: 10px;
+  }
+
+  .crumbs-bar {
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-bottom: 10px;
+  }
+
+  .crumbs {
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+
+  .crumbs::-webkit-scrollbar {
+    display: none;
+  }
+
+  .crumb {
+    max-width: 150px;
+    font-size: 12.5px;
+  }
 }
 </style>

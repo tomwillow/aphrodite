@@ -11,6 +11,7 @@ const props = defineProps<{
 const emit = defineEmits<{
   (e: 'navigate', entry: FilmEntry): void
   (e: 'open', entry: FilmEntry): void
+  (e: 'preview', entry: FilmEntry): void
   (e: 'rename', entry: FilmEntry): void
   (e: 'delete', entry: FilmEntry): void
 }>()
@@ -77,11 +78,20 @@ const fileIcon = computed(() => {
 })
 
 const dateText = computed(() => fmtTime(props.entry.mtime))
+
+// 扩展名徽章：图片和视频的缩略图一样，靠它一眼区分类型
+const extText = computed(() => {
+  const m = /\.([A-Za-z0-9]+)$/.exec(props.entry.name)
+  return (m?.[1] ?? '').toUpperCase()
+})
 </script>
 
 <template>
   <div class="card film-card" :class="{ folder: isFolder }">
-    <div class="thumb-wrap" @click="isFolder ? emit('navigate', entry) : undefined">
+    <div
+      class="thumb-wrap"
+      @click="isFolder ? emit('navigate', entry) : emit('preview', entry)"
+    >
       <!-- 文件夹：统一「标签 + 主体」轮廓；主体内按子视频数量展示缩略图 / 拼贴 / 图标 -->
       <div v-if="isFolder" class="folder-shape">
         <div class="folder-tab"></div>
@@ -128,6 +138,9 @@ const dateText = computed(() => fmtTime(props.entry.mtime))
 
       <!-- 番号角标：悬浮显示在缩略图左上角 -->
       <span v-if="entry.code" class="code-badge">{{ entry.code }}</span>
+
+      <!-- 扩展名徽章：右下角常驻（文件夹不显示，它们有数量角标） -->
+      <span v-if="!isFolder && extText" class="ext-badge">{{ extText }}</span>
     </div>
 
     <div class="meta">
@@ -279,6 +292,22 @@ const dateText = computed(() => fmtTime(props.entry.mtime))
   opacity: 1;
 }
 
+/* 扩展名徽章：常驻右下角，区分图片/视频（缩略图一样时唯一的视觉线索） */
+.ext-badge {
+  position: absolute;
+  right: 8px;
+  bottom: 8px;
+  background: rgba(20, 24, 34, 0.72);
+  color: #fff;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.5px;
+  padding: 2px 7px;
+  border-radius: 9px;
+  pointer-events: none;
+}
+
 .meta {
   padding: 10px 12px 12px;
   display: grid;
@@ -288,9 +317,14 @@ const dateText = computed(() => fmtTime(props.entry.mtime))
 .name {
   font-size: 13px;
   font-weight: 500;
+  line-height: 1.35;
+  /* 固定占 3 行：名字短时也不塌陷，同一排卡片的日期才能对齐 */
+  height: calc(1.35em * 3);
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
   overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  word-break: break-all;
 }
 
 .sub {
@@ -310,5 +344,49 @@ const dateText = computed(() => fmtTime(props.entry.mtime))
 
 .actions .danger {
   color: var(--err);
+}
+
+/* 窄屏：没有 hover，番号角标常驻；按钮缩小让一行放得下 */
+@media (max-width: 860px) {
+  .meta {
+    padding: 8px 9px 10px;
+    gap: 3px;
+  }
+
+  .name {
+    font-size: 12.5px;
+    /* 窄屏两行足够，省出高度 */
+    height: calc(1.35em * 2);
+    -webkit-line-clamp: 2;
+  }
+
+  .code-badge {
+    opacity: 1;
+    font-size: 10px;
+    padding: 2px 6px;
+    left: 6px;
+    top: 6px;
+  }
+
+  .ext-badge {
+    right: 6px;
+    bottom: 6px;
+    padding: 2px 6px;
+  }
+
+  .count-badge {
+    right: 6px;
+    bottom: 6px;
+  }
+
+  .actions {
+    gap: 4px;
+  }
+
+  .actions .btn {
+    flex: 1;
+    padding: 5px 4px;
+    font-size: 11.5px;
+  }
 }
 </style>
