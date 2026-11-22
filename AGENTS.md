@@ -66,7 +66,8 @@ backend/
   codes.py                番号 / 下载链接解析（后端为准）
   crawler.py              JavBus 客户端：搜索、详情、图片下载、全局限速
   worker.py               后台执行器 Runner：任务级 + 条目级并发、取消、重试、占位图去重
-  films.py                影片管理：目录扫描同步、番号提取、缩略图规则、重命名/删除、协议脚本
+  films.py                影片管理：目录扫描同步、番号提取、缩略图规则、重命名/删除、后台扫描调度器、协议脚本
+  filmtools.py            影片工具任务：整理番号目录 / ffmpeg 补缩略图，后台执行器（同类互斥、可取消、失败重试）
   db.py                   SQLite 数据层：schema、rev、读写、图库、影片目录/条目、迁移
   config.py               路径与全部可调参数（读环境变量）
   tests/                  pytest；conftest 把 APHRODITE_DATA 指到临时目录
@@ -75,7 +76,7 @@ web/src/
   lib/codes.ts            前端解析规则，必须与 backend/codes.py 保持一致
   lib/status.ts           状态文案 / 时间格式化
   views/                  LibraryView(影片管理首页) / SubmitView / TaskListView / TaskDetailView
-  components/FilmTree.vue 影片管理：目录树侧栏（懒加载只含文件夹）
+  components/FilmTree.vue 影片管理：目录树侧栏（懒加载只含文件夹，自动展开当前目录的祖先链）
   components/FilmCard.vue 影片管理：视频卡片（缩略图/番号角标/打开/重命名/删除）
   components/Lightbox.vue 大图查看
   styles.css              全部样式与 CSS 变量（不用 UI 框架）
@@ -135,10 +136,28 @@ scripts/
 **11. 影片管理的磁盘操作必须走 films.py**
 - 任何「root + 相对路径」都要过 `films.resolve_under_root()`（白名单 + 防穿越），`_norm_rel()` 拒绝 `..`
 - 番号提取一律复用 `codes.find_codes()` 取第一个；扫描入库时提取，磁盘与 DB 不一致时重提
-- 缩略图 = 视频同目录同名文件（换扩展名）；重命名时联动改名
+- 每级扫描列出该级**全部**条目：文件夹在前、文件在后（同类按名，`ORDER BY is_dir DESC, name COLLATE NOCASE`），**隐藏项（`.` 开头）与非视频文件也要列**。图片文件以自身作缩略图（`thumb_rel == rel_path`），其余文件 `thumb_rel=None`；番号只对视频提取
+- 缩略图 = 视频同目录同名文件（换扩展名）；重命名时联动改名；目录扫描一遍建缩略图索引，**不要逐视频重扫目录**（平方级）
+- 文件夹改名校验用 `films.DIR_FORBIDDEN_EXTS` 白名单（只拒绝真实媒体/常见文件扩展名后缀）；标题性的点（vol.2、FILE.）是合法目录名，别改回「名字含点就拒」的旧规则
 - 删除 = 真删磁盘文件（目录递归），执行前必须校验文件仍在；DB 行用 `film_delete_subtree` 清理后代
-- 扫描只扫「正在访问的那一级」，绝不做全库扫描；文件夹拼贴信息是响应时只读 peek，不写子级 DB
+- **快照与扫描分离**：`GET /api/films/entries` 只读 DB（毫秒级）+ 调度后台扫描；扫描结果（含拼贴）经 `/api/films/stream` SSE 推送。扫描调度器按级去重 + 60s TTL（`films.SCAN_TTL`），`force=1` 绕过两者（刷新按钮用）。拼贴只算不写库，快照阶段不带拼贴
+- rename/delete 只精准更新 DB 行，不内嵌重扫，然后强制调度该级后台扫描
+- 扫描只扫「正在访问的那一级」，绝不做全库扫描；影片目录在 USB 硬盘上，一次目录读取 ≈ 0.5s，任何同步等盘的写法都会把页面卡成秒级
+- 前端 `FilmCard` 内部样式名不要用 `.empty`：`styles.css` 里 `.empty` 是全局空状态类（64px padding），会给文件夹轮廓套上大内边距、压成一条线
 - 协议处理器脚本内嵌在 `films.py`（HANDLER_* 常量），`scripts/aphrodite-play*` 是手动用副本，两边要同步改
+- `/film-media` 带 `Cache-Control: max-age=86400`（URL 含完整路径，改名=新 URL），别去掉
+
+**12. 影片工具任务（filmtools.py）**
+- 任务进统一 tasks 表（`kind` 列：scrape/organize/thumb），条目明细在 `film_task_items`，进度用 total/finished；番号抓取的 items/images 表不要混用
+- 同类任务互斥（409「已有同类任务进行中」），不同类型可并行；取消 = 标 failed「已取消」保留条目，不是删任务
+- 整理目录名格式 `[番号][演员][标题]`（演员 >3 取前 3 加 `...`，标题截 60 字符，非法字符清洗）；已整理目录（`[番号]` 开头且含数字）walk 不下钻
+- 图片来源：图库命中（`db.library_get`）直接复制 → 未命中联网抓并**写回图库**；主图重命名为**与视频同名**（同名缩略图规则才能命中、文件夹封面立即生效），已有同名缩略图时以主图为准；samples 命名 番号-s2.jpg 起
+- **目录本身就是这部电影的家就地改名，不再套一层**：目录名里的番号与视频番号一致（`OFJE-041-LTX` 含 `OFJE-041`）、且整棵子树只有这一个**带番号的**视频时，直接把这个目录改名成 `[番号][演员][标题]`（旧版整理造出的「目录/标准目录/视频」会因此被拍平：内层文件提上来、删掉空壳目录）；影片根目录自身永不改名；无番号广告片不计入判定。命中后同一套流程顺带校验目录名 / 封面同名 / 详图齐全，全合格 `skipped`、有改动 `done`
+- **已整理目录不一律跳过**：多视频或视频番号与目录 `[番号]` 对不上的标准目录仍按原规则跳过；单视频且番号一致的会交出来走上述校验/修复（封面没跟视频同名则把旧命名 `番号.jpg` 改名、没有才从图库补；按图库补齐缺失的 `番号-sN`）
+- 工具任务的空列表文案要区分状态：进行中才显示「条目枚举中…」，已结束显示「没有需要处理的条目」（否则 0 条目任务会永远停在“枚举中”）
+- 任务详情页的影片条目可点击跳转影片管理（`/?dir=&path=&pick=` 深链，LibraryView 高亮 pick 条目）
+- 补缩略图只用 ffmpeg 抽中点帧；启动时先查 `shutil.which("ffmpeg")`，缺失整任务 failed（Dockerfile 的 apt 层单独成层保证缓存命中）
+- 工具任务的详情页走轮询（1.8s），不走任务 SSE 流（film_task_items 不在 changes_since 里）
 
 ## 可调参数（环境变量，见 config.py）
 
@@ -152,6 +171,8 @@ scripts/
 | `APHRODITE_TASK_WORKERS` | `2` | 同时执行的任务数 |
 | `APHRODITE_IMAGE_WORKERS` | `5` | 单番号图片并发数 |
 | `APHRODITE_MAX_ATTEMPTS` | `5` | 单图最多尝试次数 |
+| `APHRODITE_FILM_DIRS` | 空 | 影片根目录（逗号分隔，容器内路径） |
+| `APHRODITE_FILM_PATH_MAP` | 空 | 容器→本机路径映射（「打开」按钮用） |
 | `APHRODITE_FILM_DIRS` | 空 | 影片根目录列表（逗号分隔，容器内路径），影片管理入口 |
 | `APHRODITE_FILM_PATH_MAP` | 空 | 容器路径=本机路径 映射（逗号分隔），「打开」按钮换算本机路径用 |
 | `BACKEND_ORIGIN`（仅 vite dev） | `http://127.0.0.1:8000` | dev proxy 目标 |

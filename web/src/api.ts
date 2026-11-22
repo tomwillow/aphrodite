@@ -1,4 +1,6 @@
 export type TaskStatus = 'pending' | 'running' | 'completed' | 'failed'
+export type TaskKind = 'scrape' | 'organize' | 'thumb'
+export type FilmItemStatus = 'pending' | 'done' | 'skipped' | 'failed'
 export type ItemStatus = 'pending' | 'searching' | 'downloading' | 'done' | 'notfound' | 'failed'
 export type ImageStatus = 'pending' | 'downloading' | 'done' | 'failed' | 'skipped'
 
@@ -12,6 +14,21 @@ export interface Task {
   rev: number
   created_at: number
   updated_at: number
+  /** 任务类型：scrape=番号抓取（默认），organize=整理目录，thumb=补缩略图 */
+  kind?: TaskKind
+  /** 影片工具任务的条目状态计数 */
+  summary?: Record<FilmItemStatus, number>
+}
+
+export interface FilmTaskItem {
+  id: number
+  task_id: number
+  dir_id: number
+  rel_path: string
+  name: string
+  target: string
+  status: FilmItemStatus
+  error: string | null
 }
 
 export interface TaskItem {
@@ -66,6 +83,8 @@ export interface FilmEntry {
   code: string | null
   thumb_rel: string | null
   local_path: string | null
+  /** 条目类型：文件夹 / 视频 / 图片 / 其它文件 */
+  kind?: 'dir' | 'video' | 'image' | 'file'
   /** 仅文件夹：子级视频数与拼贴缩略图（相对根目录的路径） */
   video_count?: number
   collage?: string[]
@@ -75,6 +94,8 @@ export interface FilmEntriesResp {
   dir: FilmDir
   path: string
   entries: FilmEntry[]
+  /** true = 本次是 DB 快照，后台扫描完成后经 /api/films/stream 推送完整数据 */
+  scanning: boolean
 }
 
 export interface FilmHandler {
@@ -143,13 +164,64 @@ export function mediaUrl(path: string): string {
 
 // ---------------------------------------------------------------- 影片管理
 
+export interface FilmToolParams {
+  scope: 'all' | 'current'
+  dirId?: number | null
+  /** scope=current 时：从当前浏览的目录开始（空 = 该目录根级） */
+  path?: string
+  recursive: boolean
+}
+
+async function startFilmTool(tool: 'organize' | 'thumbs', p: FilmToolParams): Promise<number> {
+  const res = await fetch(`/api/films/tools/${tool}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      scope: p.scope,
+      dir_id: p.dirId ?? null,
+      path: p.path ?? '',
+      recursive: p.recursive
+    })
+  })
+  const data = await parse<{ ok: boolean; task_id: number }>(res)
+  return data.task_id
+}
+
+/** 启动「整理番号目录」后台任务，同类任务并发时抛错（409 文案）。 */
+export function startOrganize(p: FilmToolParams): Promise<number> {
+  return startFilmTool('organize', p)
+}
+
+/** 启动「补全缩略图」后台任务，同类任务并发时抛错（409 文案）。 */
+export function startThumbs(p: FilmToolParams): Promise<number> {
+  return startFilmTool('thumbs', p)
+}
+
+/** 取消影片工具任务。 */
+export async function cancelTask(id: number | string): Promise<void> {
+  const res = await fetch(`/api/tasks/${id}/cancel`, { method: 'POST' })
+  await parse<{ ok: boolean }>(res)
+}
+
+/** 失败条目重试：生成新任务，返回新任务 id。 */
+export async function retryFailedItems(id: number | string): Promise<number> {
+  const res = await fetch(`/api/tasks/${id}/retry-failed`, { method: 'POST' })
+  const data = await parse<{ ok: boolean; task_id: number }>(res)
+  return data.task_id
+}
+
 export async function fetchFilmDirs(): Promise<{ dirs: FilmDir[]; mapped: boolean }> {
   const res = await fetch('/api/films/dirs')
   return parse(res)
 }
 
-export async function fetchFilmEntries(dirId: number | string, path: string): Promise<FilmEntriesResp> {
-  const q = `dir_id=${encodeURIComponent(dirId)}&path=${encodeURIComponent(path)}`
+export async function fetchFilmEntries(
+  dirId: number | string,
+  path: string,
+  force = false
+): Promise<FilmEntriesResp> {
+  let q = `dir_id=${encodeURIComponent(dirId)}&path=${encodeURIComponent(path)}`
+  if (force) q += '&force=1'
   const res = await fetch(`/api/films/entries?${q}`)
   return parse<FilmEntriesResp>(res)
 }

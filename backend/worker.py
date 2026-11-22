@@ -210,6 +210,7 @@ class Runner:
     def _process_item(self, task_id: int, item: dict, images: list[dict]) -> None:
         item_id = int(item["id"])
         code = str(item["code"])
+        actresses: list[str] | None = None
         if self.is_item_cancelled(item_id) or not db.get_item(item_id):
             return
 
@@ -218,12 +219,15 @@ class Runner:
                 images = db.item_images(item_id)
             elif self._resolve(task_id, item):
                 images = db.item_images(item_id)
+                lib = db.library_get(code)
+                actresses = lib["actresses"] if lib else None
             else:
                 return
 
         pending = [i for i in images if i["status"] == db.IMG_PENDING]
         if not pending:
-            self._finalize_item(item_id, code)
+            lib = db.library_get(code)
+            self._finalize_item(item_id, code, lib["actresses"] if lib else None)
             return
 
         db.set_item(item_id, status=db.ITEM_DOWNLOADING, error=None)
@@ -247,7 +251,7 @@ class Runner:
 
         if self.is_item_cancelled(item_id) or not db.get_item(item_id):
             return
-        self._finalize_item(item_id, code)
+        self._finalize_item(item_id, code, actresses)
 
     def _reuse_from_library(self, task_id: int, item: dict) -> bool:
         """图库里已有该番号 → 直接建好图片行，完全不联网。"""
@@ -311,6 +315,7 @@ class Runner:
         remote: list[tuple[int, str, str]] = [(0, "cover", detail["cover"])]
         for i, url in enumerate(detail["samples"], start=1):
             remote.append((i, "sample", url))
+        actresses: list[str] = detail.get("actresses") or []
 
         # 搜索/详情页请求期间条目可能已被删除，别再把图片行写回去
         if self.is_item_cancelled(item_id) or not db.get_item(item_id):
@@ -327,7 +332,7 @@ class Runner:
         )
         return True
 
-    def _finalize_item(self, item_id: int, code: str) -> None:
+    def _finalize_item(self, item_id: int, code: str, actresses: list[str] | None = None) -> None:
         row = db.get_item(item_id)
         if not row or self.is_item_cancelled(item_id):
             return  # 条目已被删除
@@ -340,7 +345,7 @@ class Runner:
             status=db.ITEM_DONE if ok else db.ITEM_FAILED,
             error=None if ok else "所有图片下载失败",
         )
-        db.library_upsert(code, row.get("detail_url"), row.get("title"), images)
+        db.library_upsert(code, row.get("detail_url"), row.get("title"), images, actresses)
 
     # ------------------------------------------------------------ 单张图片
     def _download_one(

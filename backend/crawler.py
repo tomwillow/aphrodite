@@ -167,7 +167,13 @@ class JavBus:
         h3 = soup.select_one("h3")
         title = h3.get_text(" ", strip=True) if h3 else ""
 
-        return {"cover": cover, "samples": samples, "title": title}
+        actresses: list[str] = []
+        for a in soup.select("a[href*='/actress']"):
+            name = a.get_text(strip=True)
+            if name and name not in actresses:
+                actresses.append(name)
+
+        return {"cover": cover, "samples": samples, "title": title, "actresses": actresses}
 
     # ------------------------------------------------------------ 图片
     def download(self, url: str, referer: str | None = None) -> tuple[bytes, str]:

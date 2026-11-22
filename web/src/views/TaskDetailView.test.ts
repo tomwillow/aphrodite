@@ -79,6 +79,7 @@ function makeRouter() {
   const router = createRouter({
     history: createMemoryHistory(),
     routes: [
+      { path: '/', component: { template: '<div />' } },
       { path: '/tasks', component: { template: '<div />' } },
       { path: '/tasks/:id', name: 'task', component: TaskDetailView }
     ]
@@ -179,5 +180,78 @@ describe('TaskDetailView', () => {
     expect(call?.[1]?.method).toBe('DELETE')
     expect(wrapper.findAll('.code-row').length).toBe(0)
     expect(wrapper.find('.detail h1').text()).toContain('0 个番号')
+  })
+
+  it('影片任务：点击条目跳转影片管理（完成→目标目录，失败→原目录）', async () => {
+    const snap = snapshot({ kind: 'organize', raw_text: '整理番号目录 · 全库' })
+    snap.items = []
+    snap.images = []
+    snap.task.film_items = [
+      {
+        id: 1,
+        task_id: 1,
+        dir_id: 3,
+        rel_path: 'src/ABC-123.mp4',
+        name: 'ABC-123.mp4',
+        target: 'src/[ABC-123][葵つかさ][タイトル]',
+        status: 'done',
+        error: null
+      },
+      {
+        id: 2,
+        task_id: 1,
+        dir_id: 3,
+        rel_path: 'other/X.mp4',
+        name: 'X.mp4',
+        target: '',
+        status: 'failed',
+        error: '站内未找到该番号'
+      }
+    ]
+    const router = makeRouter()
+    await router.push('/tasks/1')
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify(snap), { status: 200 }))
+    const wrapper = mount(TaskDetailView, {
+      props: { id: '1' },
+      global: { plugins: [router] }
+    })
+    await flushPromises()
+
+    const rows = wrapper.findAll('.film-row')
+    expect(rows.length).toBe(2)
+    await rows[0].trigger('click')
+    await flushPromises()
+    expect(router.currentRoute.value.path).toBe('/')
+    expect(router.currentRoute.value.query).toEqual({
+      dir: '3',
+      path: 'src/[ABC-123][葵つかさ][タイトル]',
+      pick: 'ABC-123.mp4'
+    })
+
+    await rows[1].trigger('click')
+    await flushPromises()
+    expect(router.currentRoute.value.query).toEqual({
+      dir: '3',
+      path: 'other',
+      pick: 'X.mp4'
+    })
+  })
+
+  it('影片任务已完成但没有任何条目：提示「没有需要处理的条目」而不是「条目枚举中」', async () => {
+    const snap = snapshot({
+      kind: 'organize',
+      raw_text: '整理番号目录 · wandoujia/LTX/OFJE-041-LTX（含子目录）',
+      status: 'completed',
+      total: 0,
+      finished: 0,
+      error: null
+    })
+    snap.items = []
+    snap.images = []
+    snap.task.film_items = []
+    const wrapper = await mountDetail(snap)
+    const empty = wrapper.find('.film-items .empty')
+    expect(empty.text()).toContain('没有需要处理的条目')
+    expect(empty.text()).not.toContain('条目枚举中')
   })
 })

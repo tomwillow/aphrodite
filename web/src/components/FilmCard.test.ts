@@ -130,4 +130,72 @@ describe('FilmCard', () => {
     await buttons.find((b) => b.text() === '打开')!.trigger('click')
     expect(w.emitted('open')).toBeTruthy()
   })
+
+  it('空文件夹 / 未扫描到的文件夹：统一文件夹轮廓，不带全局 .empty 类', () => {
+    for (const videoCount of [0, undefined]) {
+      const w = mountCard(
+        entry({
+          name: 'LTX',
+          rel_path: 'LTX',
+          is_dir: true,
+          code: null,
+          thumb_rel: null,
+          video_count: videoCount,
+          collage: []
+        })
+      )
+      const shape = w.find('.folder-shape')
+      expect(shape.exists()).toBe(true)
+      // 全局 .empty 有 64px padding，会把文件夹轮廓压成一条线，必须避开
+      expect(shape.classes()).not.toContain('empty')
+      expect(w.find('.folder-tab').exists()).toBe(true)
+      expect(w.find('.folder-body').classes()).toContain('plain')
+      expect(w.find('.folder-body .thumb-empty').exists()).toBe(true)
+      expect(w.find('.count-badge').exists()).toBe(false)
+    }
+  })
+
+  it('图片文件：用自身作缩略图，不提番号', () => {
+    const w = mountCard(
+      entry({
+        name: 'cover.jpg',
+        rel_path: 'cover.jpg',
+        code: null,
+        thumb_rel: 'cover.jpg',
+        kind: 'image'
+      })
+    )
+    const img = w.find('img')
+    expect(img.attributes('src')).toBe(`/film-media/${DIR_ID}/cover.jpg`)
+    expect(w.find('.code-badge').exists()).toBe(false)
+    expect(w.text()).toContain('打开')
+  })
+
+  it('其它文件（nfo/txt/隐藏文件）：显示文件图标，仍可打开/改名/删除', () => {
+    const w = mountCard(
+      entry({
+        name: '.hidden.mp4',
+        rel_path: '.hidden.mp4',
+        code: null,
+        thumb_rel: null,
+        kind: 'video'
+      })
+    )
+    expect(w.find('img').exists()).toBe(false)
+    expect(w.find('.thumb-empty').text()).toBe('🎞')
+
+    const nfo = mountCard(
+      entry({ name: 'info.nfo', rel_path: 'info.nfo', code: null, thumb_rel: null, kind: 'file' })
+    )
+    expect(nfo.find('.thumb-empty').text()).toBe('📄')
+    expect(nfo.text()).toContain('打开')
+  })
+
+  it('缩略图加载失败时退回占位图标，不露破图', async () => {
+    const w = mountCard(entry())
+    const img = w.find('img')
+    await img.trigger('error')
+    expect(w.find('img').exists()).toBe(false)
+    expect(w.find('.thumb-empty').exists()).toBe(true)
+  })
 })

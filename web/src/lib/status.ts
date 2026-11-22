@@ -1,10 +1,23 @@
-import type { ImageStatus, ItemStatus, TaskStatus } from '../api'
+import type { FilmItemStatus, ImageStatus, ItemStatus, TaskKind, TaskStatus } from '../api'
 
 export const TASK_STATUS_TEXT: Record<TaskStatus, string> = {
   pending: '排队中',
   running: '执行中',
   completed: '已完成',
   failed: '异常'
+}
+
+export const TASK_KIND_TEXT: Record<TaskKind, string> = {
+  scrape: '番号抓取',
+  organize: '整理目录',
+  thumb: '补缩略图'
+}
+
+export const FILM_ITEM_STATUS_TEXT: Record<FilmItemStatus, string> = {
+  pending: '待处理',
+  done: '已完成',
+  skipped: '已跳过',
+  failed: '失败'
 }
 
 export const ITEM_STATUS_TEXT: Record<ItemStatus, string> = {

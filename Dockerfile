@@ -14,6 +14,21 @@ RUN npm run build
 # ---------- 2. 运行时 ----------
 FROM python:3.12-slim
 
+# ffmpeg 独立成层：只要这行不变，apt 层缓存永远命中，pip/源码变更不会重装
+# 先把 apt 源换成国内镜像（trixie 用 deb822 格式的 debian.sources）。
+# 注意：镜像源直接写死在 shell 变量里，不用 ARG——ARG 在部分环境下展开为空会把源替换成空主机名。
+RUN set -eux; \
+    MIRROR='mirrors.ustc.edu.cn'; \
+    if [ -f /etc/apt/sources.list.d/debian.sources ]; then \
+        sed -i "s|deb.debian.org|$MIRROR|g" /etc/apt/sources.list.d/debian.sources; \
+    fi; \
+    if [ -f /etc/apt/sources.list ]; then \
+        sed -i "s|deb.debian.org|$MIRROR|g" /etc/apt/sources.list; \
+    fi; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends ffmpeg; \
+    rm -rf /var/lib/apt/lists/*
+
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
@@ -25,7 +40,7 @@ ENV PYTHONUNBUFFERED=1 \
 WORKDIR /app
 
 COPY requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple -r requirements.txt
 
 COPY run.py ./
 COPY backend ./backend

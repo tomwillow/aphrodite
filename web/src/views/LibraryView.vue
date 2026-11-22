@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
+import { useRoute } from 'vue-router'
 import {
   deleteFilmEntry,
   fetchFilmDirs,
@@ -13,12 +14,28 @@ import {
 } from '../api'
 import FilmCard from '../components/FilmCard.vue'
 import FilmTree from '../components/FilmTree.vue'
+import FilmToolDialog from '../components/FilmToolDialog.vue'
 
 // ---------------------------------------------------------------- 视图切换
 type ViewMode = 'dirs' | 'category'
 const mode = ref<ViewMode>('dirs')
 const switcherOpen = ref(false)
+const toolOpen = ref(false)
+const toolDlg = ref<'organize' | 'thumb' | null>(null)
+const startedTip = ref('')
 const MODE_TEXT: Record<ViewMode, string> = { dirs: '按目录', category: '按分类' }
+
+function openTool(t: 'organize' | 'thumb') {
+  toolOpen.value = false
+  toolDlg.value = t
+}
+
+function onToolStarted(taskId: number) {
+  startedTip.value = `任务 #${taskId} 已启动，进度见任务列表`
+  window.setTimeout(() => {
+    if (startedTip.value.startsWith(`任务 #${taskId}`)) startedTip.value = ''
+  }, 6000)
+}
 
 function pickMode(m: ViewMode) {
   mode.value = m
@@ -26,21 +43,89 @@ function pickMode(m: ViewMode) {
 }
 
 // ---------------------------------------------------------------- 数据
+const route = useRoute()
 const dirs = ref<FilmDir[]>([])
 const mapped = ref(false)
 const currentDirId = ref<number | null>(null)
 const currentPath = ref('')
 const entries = ref<FilmEntry[]>([])
 const loading = ref(false)
+// true = 本次拿到的是 DB 快照，后台扫描完成后经 SSE 推送完整数据（含拼贴）
+const scanning = ref(false)
 const error = ref('')
 const refreshTick = ref(0)
+// 从任务详情跳转过来时要高亮的条目名（?pick=）
+const pickName = ref('')
+const gridRef = ref<HTMLElement | null>(null)
+
+// ---------------------------------------------------------------- 扫描推送（SSE）
+
+interface ScanEventPayload {
+  dirId: number
+  path: string
+  entries: FilmEntry[] | null
+  error: string | null
+  seq: number
+}
+const scanEvent = ref<ScanEventPayload | null>(null)
+let eventSeq = 0
+let stream: EventSource | null = null
+
+function connectStream() {
+  stream = new EventSource('/api/films/stream')
+  stream.addEventListener('scan', (ev) => {
+    try {
+      const data = JSON.parse((ev as MessageEvent).data) as {
+        dir_id: number
+        parent_rel: string
+        entries: FilmEntry[] | null
+        error?: string
+      }
+      eventSeq++
+      scanEvent.value = {
+        dirId: data.dir_id,
+        path: data.parent_rel,
+        entries: data.entries ?? null,
+        error: data.error ?? null,
+        seq: eventSeq
+      }
+      // 只处理当前正在看的级
+      if (data.dir_id !== currentDirId.value || data.parent_rel !== currentPath.value) return
+      scanning.value = false
+      if (data.error) {
+        error.value = data.error
+        entries.value = []
+      } else if (data.entries) {
+        entries.value = data.entries
+      }
+    } catch {
+      /* 忽略无法解析的事件 */
+    }
+  })
+}
+
+onBeforeUnmount(() => {
+  stream?.close()
+  stream = null
+})
 
 onMounted(async () => {
+  connectStream()
   try {
     const resp = await fetchFilmDirs()
     dirs.value = resp.dirs
     mapped.value = resp.mapped
-    if (resp.dirs.length) await selectDir(resp.dirs[0].id, '')
+    // 深链定位：/?dir=<dirId>&path=<rel>&pick=<文件名>（任务详情「查看」跳过来）
+    const qdir = Number(route.query.dir)
+    const qpath = typeof route.query.path === 'string' ? route.query.path : ''
+    const qpick = typeof route.query.pick === 'string' ? route.query.pick : ''
+    if (qdir && dirs.value.some((d) => d.id === qdir)) {
+      pickName.value = qpick
+      await selectDir(qdir, qpath)
+      await focusPick()
+    } else if (resp.dirs.length) {
+      await selectDir(resp.dirs[0].id, '')
+    }
   } catch (e) {
     error.value = e instanceof Error ? e.message : '加载影片目录失败'
   }
@@ -52,24 +137,42 @@ async function selectDir(dirId: number, path: string) {
   await reload()
 }
 
-async function reload() {
+/** 高亮 ?pick= 指定的条目并滚动到可见（任务详情跳转用）。 */
+async function focusPick() {
+  if (!pickName.value || !gridRef.value) return
+  await nextTick()
+  for (const el of Array.from(gridRef.value.children) as HTMLElement[]) {
+    if (el.dataset.name === pickName.value) {
+      el.scrollIntoView?.({ block: 'center' })
+      el.classList.add('picked-flash')
+      window.setTimeout(() => el.classList.remove('picked-flash'), 4000)
+      break
+    }
+  }
+  pickName.value = ''
+}
+
+async function reload(force = false) {
   if (currentDirId.value === null) return
   loading.value = true
   error.value = ''
   try {
-    const resp = await fetchFilmEntries(currentDirId.value, currentPath.value)
+    const resp = await fetchFilmEntries(currentDirId.value, currentPath.value, force)
     entries.value = resp.entries
+    scanning.value = resp.scanning
   } catch (e) {
     entries.value = []
+    scanning.value = false
     error.value = e instanceof Error ? e.message : '加载目录失败'
   } finally {
     loading.value = false
   }
 }
 
+/** 右上角刷新：force=1 绕过服务端 TTL，强制真实读盘 */
 async function refresh() {
   refreshTick.value++
-  await reload()
+  await reload(true)
 }
 
 const currentDir = computed(() => dirs.value.find((d) => d.id === currentDirId.value) ?? null)
@@ -200,23 +303,49 @@ async function doDelete() {
           管理本地影片目录。目录由环境变量 <code>APHRODITE_FILM_DIRS</code> 配置。
         </p>
       </div>
-      <div class="view-switch" @mouseleave="switcherOpen = false">
-        <button class="btn btn-sm" @click="switcherOpen = !switcherOpen">
-          {{ MODE_TEXT[mode] }} ▾
-        </button>
-        <div v-if="switcherOpen" class="switch-menu">
-          <button
-            v-for="(text, m) in MODE_TEXT"
-            :key="m"
-            class="switch-item"
-            :class="{ active: mode === m }"
-            @click="pickMode(m as ViewMode)"
-          >
-            {{ text }}<span v-if="m === 'category'" class="muted small"> · 开发中</span>
+      <div class="head-actions">
+        <p v-if="startedTip" class="started-tip small">{{ startedTip }}</p>
+        <div class="view-switch" @mouseleave="switcherOpen = false">
+          <button class="btn btn-sm" @click="switcherOpen = !switcherOpen">
+            {{ MODE_TEXT[mode] }} ▾
           </button>
+          <div v-if="switcherOpen" class="switch-menu">
+            <button
+              v-for="(text, m) in MODE_TEXT"
+              :key="m"
+              class="switch-item"
+              :class="{ active: mode === m }"
+              @click="pickMode(m as ViewMode)"
+            >
+              {{ text }}<span v-if="m === 'category'" class="muted small"> · 开发中</span>
+            </button>
+          </div>
+        </div>
+        <div class="view-switch" @mouseleave="toolOpen = false">
+          <button class="btn btn-sm" @click="toolOpen = !toolOpen">工具 ▾</button>
+          <div v-if="toolOpen" class="switch-menu">
+            <button class="switch-item tool-item" @click="openTool('organize')">
+              <span class="tool-name">整理番号目录</span>
+              <span class="muted small">改名建目录 + 归集图片</span>
+            </button>
+            <button class="switch-item tool-item" @click="openTool('thumb')">
+              <span class="tool-name">补全缩略图</span>
+              <span class="muted small">ffmpeg 抽帧生成</span>
+            </button>
+          </div>
         </div>
       </div>
     </div>
+
+    <FilmToolDialog
+      :open="toolDlg !== null"
+      :tool="toolDlg ?? 'organize'"
+      :dirs="dirs"
+      :current-dir-id="currentDirId"
+      :current-path="currentPath"
+      @close="toolDlg = null"
+      @started="onToolStarted"
+    />
 
     <div v-if="mode === 'category'" class="card empty">分类视图开发中，敬请期待。</div>
 
@@ -226,6 +355,7 @@ async function doDelete() {
         :current-dir-id="currentDirId"
         :current-path="currentPath"
         :refresh-tick="refreshTick"
+        :scan-event="scanEvent"
         @select="selectDir"
       />
 
@@ -246,8 +376,9 @@ async function doDelete() {
               </button>
             </template>
           </nav>
+          <span v-if="scanning && entries.length" class="muted small">同步中…</span>
           <button class="btn btn-sm ghost" :disabled="loading" @click="refresh">
-            {{ loading ? '扫描中…' : '↻ 刷新' }}
+            {{ loading ? '加载中…' : '↻ 刷新' }}
           </button>
         </div>
 
@@ -258,15 +389,19 @@ async function doDelete() {
           并在 docker-compose 里把对应目录挂载进容器。
         </div>
 
-        <div v-else-if="loading && !entries.length" class="card empty">扫描中…</div>
+        <div v-else-if="loading && !entries.length" class="card empty">加载中…</div>
+        <div v-else-if="scanning && !entries.length" class="card empty">
+          正在扫描磁盘（USB 硬盘可能需要几秒到十几秒）…
+        </div>
         <div v-else-if="!entries.length" class="card empty">此目录为空。</div>
 
-        <div v-else class="grid">
+        <div v-else ref="gridRef" class="grid">
           <FilmCard
             v-for="e in entries"
             :key="e.id"
             :entry="e"
             :dir-id="currentDirId!"
+            :data-name="e.name"
             @navigate="selectDir(currentDirId!, $event.rel_path)"
             @open="openEntry"
             @rename="startRename"
@@ -370,6 +505,28 @@ async function doDelete() {
   position: relative;
 }
 
+.head-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.started-tip {
+  color: var(--accent);
+  margin: 0;
+  white-space: nowrap;
+}
+
+.tool-item {
+  display: grid;
+  gap: 1px;
+  min-width: 190px;
+}
+
+.tool-name {
+  font-weight: 650;
+}
+
 .switch-menu {
   position: absolute;
   right: 0;
@@ -465,6 +622,13 @@ async function doDelete() {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
   gap: 14px;
+}
+
+/* 任务详情跳转过来的条目高亮 */
+.grid > .picked-flash {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+  border-radius: var(--radius);
 }
 
 .err {

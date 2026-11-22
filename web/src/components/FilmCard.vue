@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { filmMediaUrl, type FilmEntry } from '../api'
 import { fmtTime } from '../lib/status'
 
@@ -15,6 +15,7 @@ const emit = defineEmits<{
   (e: 'delete', entry: FilmEntry): void
 }>()
 
+const kind = computed(() => props.entry.kind ?? (props.entry.is_dir ? 'dir' : 'video'))
 const isFolder = computed(() => props.entry.is_dir)
 // 单视频文件夹：按「视频卡片」样式展示，但套一层文件夹轮廓
 const isSingleVideoFolder = computed(
@@ -41,62 +42,88 @@ const collageUrls = computed(() =>
     : []
 )
 
+// 图片加载失败（文件被删/被锁）时退回占位图标，避免露出浏览器破图
+const thumbFailed = ref(false)
+const folderThumbFailed = ref(false)
+const failedCollage = ref<number[]>([])
+watch(
+  () => [props.entry.thumb_rel, props.entry.collage],
+  () => {
+    thumbFailed.value = false
+    folderThumbFailed.value = false
+    failedCollage.value = []
+  }
+)
+
+const showThumb = computed(() => !!thumbUrl.value && !thumbFailed.value)
+const showFolderThumb = computed(
+  () => !!folderThumbUrl.value && !folderThumbFailed.value
+)
+const collageItems = computed(() =>
+  collageUrls.value
+    .map((url, i) => ({ url, i }))
+    .filter((it) => !failedCollage.value.includes(it.i))
+)
+// 拼贴补位：只有已有图片时才补满 2x2；一张都没有就直接显示文件夹图标
+const pads = computed(() =>
+  collageItems.value.length ? Math.max(0, 4 - collageItems.value.length) : 0
+)
+
+// 非视频文件（图片 / 其它）的占位图标
+const fileIcon = computed(() => {
+  if (kind.value === 'image') return '🖼'
+  if (kind.value === 'video') return '🎞'
+  return '📄'
+})
+
 const dateText = computed(() => fmtTime(props.entry.mtime))
 </script>
 
 <template>
   <div class="card film-card" :class="{ folder: isFolder }">
     <div class="thumb-wrap" @click="isFolder ? emit('navigate', entry) : undefined">
-      <!-- 单视频文件夹：文件夹轮廓内嵌大缩略图 -->
-      <template v-if="isSingleVideoFolder">
-        <div class="folder-shape single">
-          <div class="folder-tab"></div>
-          <div class="folder-body single">
-            <img v-if="folderThumbUrl" :src="folderThumbUrl" alt="" loading="lazy" />
-            <div v-else class="thumb-empty">🎞</div>
-          </div>
-        </div>
-      </template>
+      <!-- 文件夹：统一「标签 + 主体」轮廓；主体内按子视频数量展示缩略图 / 拼贴 / 图标 -->
+      <div v-if="isFolder" class="folder-shape">
+        <div class="folder-tab"></div>
 
-      <!-- 多视频文件夹：文件夹轮廓内嵌 2x2 拼贴 + 数量角标 -->
-      <template v-else-if="isMultiVideoFolder">
-        <div class="folder-shape single">
-          <div class="folder-tab"></div>
-          <div class="folder-body collage">
-            <template v-if="collageUrls.length">
-              <img
-                v-for="(u, i) in collageUrls"
-                :key="i"
-                :src="u"
-                alt=""
-                loading="lazy"
-              />
-              <div
-                v-for="i in Math.max(0, 4 - collageUrls.length)"
-                :key="'pad' + i"
-                class="collage-pad"
-              ></div>
-            </template>
-            <div v-else class="thumb-empty">🗂</div>
-          </div>
-          <span class="count-badge">{{ entry.video_count }}</span>
+        <!-- 单视频文件夹：主体内放大缩略图 -->
+        <div v-if="isSingleVideoFolder" class="folder-body single">
+          <img
+            v-if="showFolderThumb"
+            :src="folderThumbUrl"
+            alt=""
+            loading="lazy"
+            @error="folderThumbFailed = true"
+          />
+          <div v-else class="thumb-empty">🎞</div>
         </div>
-      </template>
 
-      <!-- 空文件夹 -->
-      <template v-else-if="isFolder">
-        <div class="folder-shape empty">
-          <div class="folder-tab"></div>
-          <div class="folder-body">
-            <div class="thumb-empty">🗂</div>
-          </div>
+        <!-- 多视频文件夹：2x2 拼贴 -->
+        <div v-else-if="isMultiVideoFolder" class="folder-body collage">
+          <img
+            v-for="it in collageItems"
+            :key="it.i"
+            :src="it.url"
+            alt=""
+            loading="lazy"
+            @error="failedCollage = [...failedCollage, it.i]"
+          />
+          <div v-for="i in pads" :key="'pad' + i" class="collage-pad"></div>
+          <div v-if="!collageItems.length" class="thumb-empty">🗂</div>
         </div>
-      </template>
 
-      <!-- 视频文件 -->
+        <!-- 空文件夹 / 尚未扫描到的文件夹 -->
+        <div v-else class="folder-body plain">
+          <div class="thumb-empty">🗂</div>
+        </div>
+
+        <span v-if="isMultiVideoFolder" class="count-badge">{{ entry.video_count }}</span>
+      </div>
+
+      <!-- 文件：图片用自身作缩略图，其余显示文件图标 -->
       <template v-else>
-        <img v-if="thumbUrl" :src="thumbUrl" alt="" loading="lazy" />
-        <div v-else class="thumb-empty">🎞</div>
+        <img v-if="showThumb" :src="thumbUrl" alt="" loading="lazy" @error="thumbFailed = true" />
+        <div v-else class="thumb-empty">{{ fileIcon }}</div>
       </template>
 
       <!-- 番号角标：悬浮显示在缩略图左上角 -->
@@ -141,10 +168,6 @@ const dateText = computed(() => fmtTime(props.entry.mtime))
   cursor: pointer;
 }
 
-.folder .thumb-wrap {
-  cursor: pointer;
-}
-
 .thumb-wrap > img {
   width: 100%;
   height: 100%;
@@ -154,6 +177,7 @@ const dateText = computed(() => fmtTime(props.entry.mtime))
 .thumb-empty {
   font-size: 34px;
   opacity: 0.45;
+  line-height: 1;
 }
 
 /* 文件夹轮廓：顶部标签 + 主体，缩略图占比要大 */
@@ -167,6 +191,7 @@ const dateText = computed(() => fmtTime(props.entry.mtime))
 
 .folder-tab {
   height: 12%;
+  min-height: 10px;
   width: 34%;
   background: #d9dce6;
   border-radius: 6px 8px 0 0;
@@ -174,23 +199,34 @@ const dateText = computed(() => fmtTime(props.entry.mtime))
 
 .folder-body {
   flex: 1;
+  min-height: 0;
   background: #e4e7ef;
   border-radius: 0 8px 8px 8px;
-  display: grid;
-  grid-template-columns: repeat(2, 1fr);
-  grid-template-rows: repeat(2, 1fr);
-  gap: 2px;
   padding: 4px;
   overflow: hidden;
+  display: grid;
+  place-items: center;
 }
 
-.folder-body.single {
+/* 空文件夹：图标居中 */
+.folder-body.plain {
   grid-template-columns: 1fr;
   grid-template-rows: 1fr;
 }
 
-.folder-shape.single .folder-body {
-  padding: 4px;
+/* 单视频：一张图铺满主体 */
+.folder-body.single {
+  grid-template-columns: 1fr;
+  grid-template-rows: 1fr;
+  place-items: stretch;
+}
+
+/* 多视频：2x2 拼贴 */
+.folder-body.collage {
+  grid-template-columns: repeat(2, 1fr);
+  grid-template-rows: repeat(2, 1fr);
+  gap: 2px;
+  place-items: stretch;
 }
 
 .folder-body img {
@@ -198,18 +234,18 @@ const dateText = computed(() => fmtTime(props.entry.mtime))
   height: 100%;
   object-fit: cover;
   border-radius: 4px;
-  grid-column: span 2;
-  grid-row: span 2;
-}
-
-.folder-body.collage img {
-  grid-column: auto;
-  grid-row: auto;
 }
 
 .collage-pad {
   background: #eef0f5;
   border-radius: 4px;
+}
+
+/* 拼贴里没有任何图时，图标占满 2x2 并居中 */
+.folder-body.collage .thumb-empty {
+  grid-column: span 2;
+  grid-row: span 2;
+  place-self: center;
 }
 
 .count-badge {

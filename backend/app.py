@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import queue
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -13,7 +14,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import db, films
+from . import db, filmtools, films
 from .codes import parse_text
 from .config import FILM_DIRS, FILM_PATH_MAP, IMAGES_DIR, WEB_DIST, ensure_dirs
 from .worker import runner
@@ -52,6 +53,13 @@ class FilmDeleteIn(BaseModel):
     entry_id: int
 
 
+class FilmToolIn(BaseModel):
+    scope: str = "all"          # all | current
+    dir_id: int | None = None   # scope=current 时必填
+    path: str = ""              # scope=current 时：从哪个相对路径开始（空 = 该目录根级）
+    recursive: bool = True      # 仅 scope=current 有意义：是否遍历子目录
+
+
 @app.get("/api/health")
 def health() -> dict[str, Any]:
     return {"ok": True, "time": time.time()}
@@ -77,7 +85,11 @@ def create_task(payload: CreateTaskIn) -> dict[str, Any]:
 
 @app.get("/api/tasks")
 def api_tasks() -> dict[str, Any]:
-    return {"tasks": db.list_tasks()}
+    tasks = db.list_tasks()
+    for t in tasks:
+        if t.get("kind") in (db.TASK_ORGANIZE, db.TASK_THUMB):
+            t["summary"] = db.film_task_summary(int(t["id"]))
+    return {"tasks": tasks}
 
 
 @app.get("/api/tasks/{task_id}")
@@ -85,17 +97,48 @@ def api_task(task_id: int) -> dict[str, Any]:
     snap = db.snapshot(task_id)
     if not snap["task"]:
         raise HTTPException(status_code=404, detail="任务不存在")
+    t = snap["task"]
+    if t.get("kind") in (db.TASK_ORGANIZE, db.TASK_THUMB):
+        t["summary"] = db.film_task_summary(task_id)
+        t["film_items"] = db.film_list_items(task_id)
     return snap
 
 
 @app.delete("/api/tasks/{task_id}")
 def delete_task(task_id: int) -> dict[str, Any]:
-    if not db.get_task(task_id):
+    task = db.get_task(task_id)
+    if not task:
         raise HTTPException(status_code=404, detail="任务不存在")
     # 先打取消标记，执行线程会在下一个检查点退出并清理残留
-    runner.cancel(task_id)
+    if task.get("kind") in (db.TASK_ORGANIZE, db.TASK_THUMB):
+        filmtools.runner.cancel(task_id)
+    else:
+        runner.cancel(task_id)
     db.delete_task(task_id)
     return {"ok": True}
+
+
+@app.post("/api/tasks/{task_id}/cancel")
+def cancel_task(task_id: int) -> dict[str, Any]:
+    """取消影片工具任务（番号抓取沿用删除即取消的语义，不提供单独取消）。"""
+    task = db.get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    if task.get("kind") not in (db.TASK_ORGANIZE, db.TASK_THUMB):
+        raise HTTPException(status_code=400, detail="番号抓取任务请直接删除")
+    if not filmtools.runner.cancel(task_id):
+        raise HTTPException(status_code=400, detail="任务不在执行中")
+    return {"ok": True}
+
+
+@app.post("/api/tasks/{task_id}/retry-failed")
+def retry_failed_items(task_id: int) -> dict[str, Any]:
+    """整理/补图任务失败条目重试：生成新任务，只带失败条目。"""
+    try:
+        new_id = filmtools.runner.retry_failed(task_id)
+    except filmtools.FilmToolError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"ok": True, "task_id": new_id}
 
 
 @app.delete("/api/tasks/{task_id}/items/{item_id}")
@@ -190,6 +233,36 @@ def _film_error(e: FilmError) -> HTTPException:
     return HTTPException(status_code=400, detail=str(e))
 
 
+def _film_tool_error(e: filmtools.FilmToolError) -> HTTPException:
+    return HTTPException(status_code=409, detail=str(e))
+
+
+@app.post("/api/films/tools/organize")
+def api_film_tool_organize(payload: FilmToolIn) -> dict[str, Any]:
+    """启动「整理番号目录」后台任务，返回任务 id（同类任务并发时 409）。"""
+    try:
+        task_id = filmtools.runner.start(
+            db.TASK_ORGANIZE, payload.scope, payload.dir_id, payload.path,
+            payload.recursive
+        )
+    except filmtools.FilmToolError as e:
+        raise _film_tool_error(e)
+    return {"ok": True, "task_id": task_id}
+
+
+@app.post("/api/films/tools/thumbs")
+def api_film_tool_thumbs(payload: FilmToolIn) -> dict[str, Any]:
+    """启动「补全缩略图」后台任务，返回任务 id（同类任务并发时 409）。"""
+    try:
+        task_id = filmtools.runner.start(
+            db.TASK_THUMB, payload.scope, payload.dir_id, payload.path,
+            payload.recursive
+        )
+    except filmtools.FilmToolError as e:
+        raise _film_tool_error(e)
+    return {"ok": True, "task_id": task_id}
+
+
 @app.get("/api/films/dirs")
 def api_film_dirs() -> dict[str, Any]:
     dirs = db.film_sync_dirs([str(p) for p in FILM_DIRS])
@@ -197,21 +270,66 @@ def api_film_dirs() -> dict[str, Any]:
 
 
 @app.get("/api/films/entries")
-def api_film_entries(dir_id: int, path: str = "") -> dict[str, Any]:
+def api_film_entries(dir_id: int, path: str = "", force: int = 0) -> dict[str, Any]:
+    """目录条目：TTL 内返回缓存的完整载荷；否则 DB 快照（毫秒级）+ 调度后台扫描。
+
+    前端拿到 scanning=true 的快照先渲染，扫描完成后经 /api/films/stream 推送替换。
+    force=1（右上角刷新按钮）绕过 TTL 强制读盘。
+    """
     d = db.film_get_dir(dir_id)
     if not d:
         raise HTTPException(status_code=404, detail="影片目录不存在")
     if not d["valid"]:
         raise HTTPException(status_code=400, detail=f"影片目录不可访问：{d['path']}")
     try:
-        entries = films.scan_and_sync(dir_id, path)
+        rel = films._norm_rel(path)
+        if not force:
+            cached = films.get_cached(dir_id, rel)
+            if cached is not None:
+                return {"dir": d, "path": rel, "entries": cached, "scanning": False}
+        films.schedule_scan(dir_id, rel, force=bool(force))
+        snapshot = films.level_snapshot(dir_id, rel)
     except films.FilmError as e:
         raise _film_error(e)
     return {
         "dir": d,
-        "path": films._norm_rel(path),
-        "entries": entries,
+        "path": rel,
+        "entries": snapshot,
+        "scanning": True,
     }
+
+
+@app.get("/api/films/stream")
+async def api_film_stream(request: Request) -> StreamingResponse:
+    """影片扫描结果推送（SSE）：后台扫描完成后推 scan 事件，载荷为该级完整条目。"""
+    sub = films.subscribe()
+
+    async def gen() -> AsyncIterator[bytes]:
+        try:
+            yield _sse("open", {"ok": True})
+            while True:
+                if await request.is_disconnected():
+                    break
+                try:
+                    evt = sub.get_nowait()
+                except queue.Empty:
+                    evt = None
+                if evt is not None:
+                    yield _sse("scan", evt)
+                else:
+                    await asyncio.sleep(0.35)
+        finally:
+            films.unsubscribe(sub)
+
+    return StreamingResponse(
+        gen(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
 
 
 @app.post("/api/films/rename")
@@ -253,7 +371,11 @@ def film_media(dir_id: int, rel_path: str) -> FileResponse:
         raise _film_error(e)
     if not target.is_file():
         raise HTTPException(status_code=404, detail="文件不存在")
-    return FileResponse(target)
+    # 缩略图基本不变：让浏览器缓存一天，翻页/重进不再从磁盘重读。
+    # URL 含完整路径与文件名，改名即新 URL，删除后 404，缓存不会张冠李戴。
+    return FileResponse(
+        target, headers={"Cache-Control": "public, max-age=86400"}
+    )
 
 
 

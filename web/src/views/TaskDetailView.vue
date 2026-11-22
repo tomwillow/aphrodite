@@ -1,18 +1,28 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import { useRouter } from 'vue-router'
 import Lightbox from '../components/Lightbox.vue'
 import {
   deleteTaskItem,
   fetchTask,
   mediaUrl,
+  retryFailedItems,
   retryTask,
+  type FilmTaskItem,
   type Task,
   type TaskImage,
   type TaskItem
 } from '../api'
-import { IMAGE_STATUS_TEXT, ITEM_STATUS_TEXT, TASK_STATUS_TEXT, fmtTime } from '../lib/status'
+import {
+  FILM_ITEM_STATUS_TEXT,
+  IMAGE_STATUS_TEXT,
+  ITEM_STATUS_TEXT,
+  TASK_STATUS_TEXT,
+  fmtTime
+} from '../lib/status'
 
 const props = defineProps<{ id: string }>()
+const router = useRouter()
 
 const LEVELS = [
   { key: 'sm', label: '小', h: 96 },
@@ -26,6 +36,7 @@ type LevelKey = (typeof LEVELS)[number]['key']
 const task = ref<Task | null>(null)
 const items = ref<TaskItem[]>([])
 const images = ref<TaskImage[]>([])
+const filmItems = ref<FilmTaskItem[]>([])
 const loading = ref(true)
 const error = ref('')
 const finished = ref(false)
@@ -35,13 +46,30 @@ const lightbox = ref<{ src: string; caption: string } | null>(null)
 const deletingItem = ref<number | null>(null)
 const copyState = ref<{ id: number; ok: boolean } | null>(null)
 
-const size = ref<LevelKey>((localStorage.getItem('aphrodite.shot') as LevelKey) || 'md')
-const shotHeight = computed(() => LEVELS.find((l) => l.key === size.value)?.h ?? 144)
-
 let rev = 0
 let es: EventSource | null = null
 let retryTimer: number | undefined
 let copyTimer: number | undefined
+let pollTimer: number | undefined
+
+const isFilmTask = computed(
+  () => task.value?.kind === 'organize' || task.value?.kind === 'thumb'
+)
+
+const filmFailedCount = computed(
+  () => filmItems.value.filter((i) => i.status === 'failed').length
+)
+
+const filmDoneCount = computed(
+  () => filmItems.value.filter((i) => i.status === 'done').length
+)
+
+const filmSkippedCount = computed(
+  () => filmItems.value.filter((i) => i.status === 'skipped').length
+)
+
+const size = ref<LevelKey>((localStorage.getItem('aphrodite.shot') as LevelKey) || 'md')
+const shotHeight = computed(() => LEVELS.find((l) => l.key === size.value)?.h ?? 144)
 
 function setSize(key: LevelKey) {
   size.value = key
@@ -109,6 +137,7 @@ async function loadFull() {
   task.value = snap.task
   items.value = snap.items
   images.value = [...snap.images].sort((a, b) => a.item_id - b.item_id || a.seq - b.seq)
+  filmItems.value = snap.task.film_items ?? []
   rev = Math.max(
     rev,
     snap.task.rev,
@@ -117,6 +146,25 @@ async function loadFull() {
   )
   if (snap.task.status === 'completed' || snap.task.status === 'failed') markFinished()
   loading.value = false
+}
+
+function startPolling() {
+  if (finished.value) return
+  pollTimer = window.setInterval(async () => {
+    if (document.visibilityState !== 'visible') return
+    try {
+      const snap = await fetchTask(props.id)
+      task.value = snap.task
+      filmItems.value = snap.task.film_items ?? []
+      if (snap.task.status === 'completed' || snap.task.status === 'failed') {
+        finished.value = true
+        if (pollTimer) window.clearInterval(pollTimer)
+        pollTimer = undefined
+      }
+    } catch {
+      /* 忽略，下一轮再试 */
+    }
+  }, 1800)
 }
 
 function connect() {
@@ -167,7 +215,8 @@ function connect() {
 onMounted(async () => {
   try {
     await loadFull()
-    connect()
+    if (isFilmTask.value) startPolling()
+    else connect()
   } catch (e) {
     error.value = e instanceof Error ? e.message : '加载失败'
     loading.value = false
@@ -180,6 +229,7 @@ onBeforeUnmount(() => {
   es = null
   if (retryTimer) window.clearTimeout(retryTimer)
   if (copyTimer) window.clearTimeout(copyTimer)
+  if (pollTimer) window.clearInterval(pollTimer)
 })
 
 function openImage(img: TaskImage, item: TaskItem) {
@@ -213,8 +263,40 @@ async function retryFailed() {
   }
 }
 
+async function retryFilmFailed() {
+  if (!task.value || retrying.value) return
+  retrying.value = true
+  retryHint.value = ''
+  try {
+    const newId = await retryFailedItems(task.value.id)
+    retryHint.value = `已生成重试任务 #${newId}，仅处理失败条目`
+  } catch (e) {
+    retryHint.value = e instanceof Error ? e.message : '重试失败'
+  } finally {
+    retrying.value = false
+  }
+}
+
 function thumbStyle() {
   return { '--shot-h': `${shotHeight.value}px` }
+}
+
+/** 点击影片任务条目 → 跳到影片管理页该文件所在目录并高亮。 */
+function jumpToFilm(it: FilmTaskItem) {
+  let path: string
+  if (it.status === 'done' && it.target) {
+    // organize 的 target 是目标目录本身；thumb 的 target 是生成的缩略图文件路径
+    path =
+      task.value?.kind === 'organize'
+        ? it.target
+        : it.target.split('/').slice(0, -1).join('/')
+  } else {
+    // 未完成/失败：文件还在原位，去它的上级目录
+    path = it.rel_path.includes('/')
+      ? it.rel_path.split('/').slice(0, -1).join('/')
+      : ''
+  }
+  router.push({ path: '/', query: { dir: String(it.dir_id), path, pick: it.name } })
 }
 
 async function removeItem(item: TaskItem) {
@@ -285,19 +367,38 @@ function isHttpLink(link: string) {
           <span>#{{ task.id }}</span>
         </div>
         <h1>
-          {{ task.total }} 个番号
-          <span class="badge" :class="task.status">
-            <span v-if="isLive" class="pulse"></span>{{ TASK_STATUS_TEXT[task.status] }}
-          </span>
+          <template v-if="isFilmTask">
+            {{ task.raw_text }}
+            <span class="badge" :class="task.status">
+              <span v-if="isLive" class="pulse"></span>{{ TASK_STATUS_TEXT[task.status] }}
+            </span>
+          </template>
+          <template v-else>
+            {{ task.total }} 个番号
+            <span class="badge" :class="task.status">
+              <span v-if="isLive" class="pulse"></span>{{ TASK_STATUS_TEXT[task.status] }}
+            </span>
+          </template>
         </h1>
         <p class="muted small">
-          {{ fmtTime(task.created_at) }} 提交 · {{ task.finished }}/{{ task.total }} 处理完成
+          {{ fmtTime(task.created_at) }} 提交 · {{ task.finished }}/{{ task.total }} 条已处理
+          <template v-if="isFilmTask && (filmSkippedCount || filmFailedCount)">
+            · 跳过 {{ filmSkippedCount }} · 失败 {{ filmFailedCount }}
+          </template>
           <span v-if="task.error"> · {{ task.error }}</span>
         </p>
       </div>
 
       <div class="head-actions">
-        <button v-if="canRetry" class="btn btn-sm retry" :disabled="retrying" @click="retryFailed">
+        <button
+          v-if="isFilmTask && (task.status === 'completed' || task.status === 'failed') && filmFailedCount"
+          class="btn btn-sm retry"
+          :disabled="retrying"
+          @click="retryFilmFailed"
+        >
+          {{ retrying ? '重试中…' : `重试失败条目（${filmFailedCount}）` }}
+        </button>
+        <button v-if="!isFilmTask && canRetry" class="btn btn-sm retry" :disabled="retrying" @click="retryFailed">
           {{
             retrying
               ? '重试中…'
@@ -306,8 +407,8 @@ function isHttpLink(link: string) {
                 : '继续任务'
           }}
         </button>
-        <span class="muted small">图片大小</span>
-        <div class="segmented">
+        <span class="muted small" v-if="!isFilmTask">图片大小</span>
+        <div class="segmented" v-if="!isFilmTask">
           <button
             v-for="lv in LEVELS"
             :key="lv.key"
@@ -326,6 +427,28 @@ function isHttpLink(link: string) {
       <div class="bar" :style="{ width: progressPct + '%' }"></div>
     </div>
 
+    <div v-if="isFilmTask" class="film-items">
+      <div v-if="!filmItems.length" class="card empty">
+        <template v-if="isLive">条目枚举中…（不做预扫，任务启动后动态增加）</template>
+        <template v-else-if="task.error">没有需要处理的条目：{{ task.error }}</template>
+        <template v-else>没有需要处理的条目（目录里没有可整理/可补图的视频）</template>
+      </div>
+      <button
+        v-for="it in filmItems"
+        :key="it.id"
+        class="film-row"
+        :title="`查看 ${it.name} 在影片管理中的位置`"
+        @click="jumpToFilm(it)"
+      >
+        <span class="film-name" :title="it.rel_path">{{ it.name }}</span>
+        <span v-if="it.target" class="film-target muted" :title="it.target">→ {{ it.target }}</span>
+        <span class="badge" :class="it.status">{{ FILM_ITEM_STATUS_TEXT[it.status] }}</span>
+        <span v-if="it.error" class="item-err">{{ it.error }}</span>
+        <span class="film-jump">查看 ↗</span>
+      </button>
+    </div>
+
+    <template v-else>
     <article v-for="item in items" :key="item.id" class="code-row">
       <div class="code-head">
         <span class="code">{{ item.code }}</span>
@@ -419,6 +542,7 @@ function isHttpLink(link: string) {
         </button>
       </div>
     </article>
+    </template>
 
     <Lightbox
       v-if="lightbox"
@@ -432,6 +556,75 @@ function isHttpLink(link: string) {
 <style scoped>
 .detail {
   padding-bottom: 40px;
+}
+
+.film-items {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  overflow: hidden;
+}
+
+.film-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 16px;
+  border-bottom: 1px solid var(--line);
+  font-size: 13px;
+  width: 100%;
+  text-align: left;
+  background: none;
+  border-left: 0;
+  border-right: 0;
+  border-top: 0;
+  color: var(--text);
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+.film-row:hover {
+  background: #f6f7fb;
+}
+
+.film-jump {
+  flex: 0 0 auto;
+  font-size: 12px;
+  color: var(--accent);
+  opacity: 0;
+  transition: opacity 0.15s;
+  white-space: nowrap;
+}
+
+.film-row:hover .film-jump {
+  opacity: 1;
+}
+
+.film-row:last-child {
+  border-bottom: 0;
+}
+
+.film-name {
+  font-weight: 650;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 0 1 auto;
+}
+
+.film-target {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+}
+
+.badge.skipped {
+  background: #eef1f7;
+  color: #5b6271;
 }
 
 .page-head {

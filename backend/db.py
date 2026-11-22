@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import itertools
+import json
 import shutil
 import sqlite3
 import threading
@@ -39,6 +40,18 @@ IMG_FAILED = "failed"
 IMG_SKIPPED = "skipped"  # 站点返回的占位图（多张内容完全相同），跳过不展示
 
 ITEM_TERMINAL = (ITEM_DONE, ITEM_NOTFOUND, ITEM_FAILED)
+
+# 任务类型：scrape=番号抓取（默认），organize=整理番号目录，thumb=补全缩略图
+TASK_SCRAPER = "scrape"
+TASK_ORGANIZE = "organize"
+TASK_THUMB = "thumb"
+
+# 影片工具任务的条目状态
+FT_PENDING = "pending"
+FT_DONE = "done"
+FT_SKIPPED = "skipped"
+FT_FAILED = "failed"
+FT_TERMINAL = (FT_DONE, FT_SKIPPED, FT_FAILED)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS tasks (
@@ -90,6 +103,7 @@ CREATE TABLE IF NOT EXISTS library (
     code        TEXT PRIMARY KEY,
     detail_url  TEXT,
     title       TEXT,
+    actresses   TEXT,               -- JSON 数组字符串，演员列表
     updated_at  REAL NOT NULL
 );
 
@@ -138,6 +152,21 @@ CREATE TABLE IF NOT EXISTS film_entries (
     UNIQUE(dir_id, rel_path)
 );
 CREATE INDEX IF NOT EXISTS idx_film_entries_level ON film_entries(dir_id, parent_rel);
+
+-- 影片工具任务（整理目录 / 补缩略图）的条目明细
+CREATE TABLE IF NOT EXISTS film_task_items (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id     INTEGER NOT NULL,
+    dir_id      INTEGER NOT NULL,          -- 所属影片根目录
+    rel_path    TEXT    NOT NULL,          -- 视频的 posix 相对路径
+    name        TEXT    NOT NULL,          -- 视频文件名
+    target      TEXT    NOT NULL DEFAULT '', -- 整理：目标目录名；补图：生成的缩略图路径
+    status      TEXT    NOT NULL DEFAULT 'pending', -- pending/done/skipped/failed
+    error       TEXT,
+    rev         INTEGER NOT NULL DEFAULT 0,
+    updated_at  REAL    NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_film_items_task ON film_task_items(task_id, status);
 """
 
 
@@ -166,7 +195,9 @@ def init() -> None:
             "SELECT MAX(r) AS m FROM ("
             " SELECT MAX(rev) AS r FROM tasks"
             " UNION ALL SELECT MAX(rev) FROM items"
-            " UNION ALL SELECT MAX(rev) FROM images)"
+            " UNION ALL SELECT MAX(rev) FROM images"
+            " UNION ALL SELECT MAX(rev) FROM film_entries"
+            " UNION ALL SELECT MAX(rev) FROM film_task_items)"
         ).fetchone()
         start = (row["m"] or 0) + 1
     global _rev_counter
@@ -190,6 +221,12 @@ def _migrate(c: sqlite3.Connection) -> None:
     image_cols = {r["name"] for r in c.execute("PRAGMA table_info(images)")}
     if "attempts" not in image_cols:
         c.execute("ALTER TABLE images ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0")
+    task_cols = {r["name"] for r in c.execute("PRAGMA table_info(tasks)")}
+    if "kind" not in task_cols:
+        c.execute("ALTER TABLE tasks ADD COLUMN kind TEXT NOT NULL DEFAULT 'scrape'")
+    lib_cols = {r["name"] for r in c.execute("PRAGMA table_info(library)")}
+    if "actresses" not in lib_cols:
+        c.execute("ALTER TABLE library ADD COLUMN actresses TEXT")
     c.commit()
 
 
@@ -405,6 +442,7 @@ def delete_task(task_id: int) -> None:
         c.execute("DELETE FROM images WHERE task_id=?", (task_id,))
         c.execute("DELETE FROM items WHERE task_id=?", (task_id,))
         c.execute("DELETE FROM removals WHERE task_id=?", (task_id,))
+        c.execute("DELETE FROM film_task_items WHERE task_id=?", (task_id,))
         c.execute("DELETE FROM tasks WHERE id=?", (task_id,))
         c.commit()
 
@@ -612,6 +650,137 @@ def film_delete_subtree(dir_id: int, rel_path: str) -> int:
     return n
 
 
+# ------------------------------------------------------- 影片工具任务明细
+
+def create_film_task(kind: str, label: str) -> int:
+    """建影片工具任务（整理目录 / 补缩略图），条目随后动态追加。"""
+    now = time.time()
+    with _write_lock, conn() as c:
+        cur = c.execute(
+            "INSERT INTO tasks(raw_text, kind, status, total, finished, rev, created_at, updated_at)"
+            " VALUES(?,?,?,?,0,?,?,?)",
+            (label, kind, TASK_RUNNING, 0, next_rev(), now, now),
+        )
+        task_id = int(cur.lastrowid)
+        c.commit()
+    return task_id
+
+
+def film_add_items(task_id: int, rows: Iterable[dict[str, Any]]) -> int:
+    """给影片工具任务追加条目，返回追加数；total 同步增加。"""
+    values = [
+        (
+            task_id,
+            int(r["dir_id"]),
+            r["rel_path"],
+            r["name"],
+            r.get("target") or "",
+            FT_PENDING,
+            next_rev(),
+            time.time(),
+        )
+        for r in rows
+    ]
+    if not values:
+        return 0
+    with _write_lock, conn() as c:
+        c.executemany(
+            "INSERT INTO film_task_items"
+            "(task_id, dir_id, rel_path, name, target, status, rev, updated_at)"
+            " VALUES(?,?,?,?,?,?,?,?)",
+            values,
+        )
+        c.execute("UPDATE tasks SET total=total+? WHERE id=?", (len(values), task_id))
+        c.commit()
+    return len(values)
+
+
+def film_list_items(task_id: int) -> list[dict[str, Any]]:
+    rows = conn().execute(
+        "SELECT * FROM film_task_items WHERE task_id=? ORDER BY id", (task_id,)
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def film_next_pending(task_id: int) -> dict[str, Any] | None:
+    """取下一个待处理条目并置为 running 语义（这里用 pending 占位，靠返回即认领）。"""
+    with _write_lock, conn() as c:
+        row = c.execute(
+            "SELECT * FROM film_task_items WHERE task_id=? AND status=?"
+            " ORDER BY id LIMIT 1",
+            (task_id, FT_PENDING),
+        ).fetchone()
+        if row is None:
+            return None
+        item = dict(row)
+        c.commit()
+    return item
+
+
+def film_touch_item(item_id: int, **fields: Any) -> None:
+    fields["rev"] = next_rev()
+    fields["updated_at"] = time.time()
+    sets = ", ".join(f"{k}=?" for k in fields)
+    with _write_lock, conn() as c:
+        c.execute(f"UPDATE film_task_items SET {sets} WHERE id=?", (*fields.values(), item_id))
+        c.commit()
+
+
+def film_finish_item(item_id: int, status: str, error: str | None = None,
+                     target: str | None = None) -> None:
+    """条目落终态 + 任务 finished 计数 +1。"""
+    now = time.time()
+    with _write_lock, conn() as c:
+        task_id = c.execute(
+            "SELECT task_id FROM film_task_items WHERE id=?", (item_id,)
+        ).fetchone()["task_id"]
+        c.execute(
+            "UPDATE film_task_items SET status=?, error=?, target=COALESCE(?,target),"
+            " rev=?, updated_at=? WHERE id=?",
+            (status, error, target, next_rev(), now, item_id),
+        )
+        c.execute("UPDATE tasks SET finished=finished+1 WHERE id=?", (task_id,))
+        c.commit()
+
+
+def film_task_summary(task_id: int) -> dict[str, int]:
+    c = conn()
+    counts = {k: 0 for k in (FT_PENDING, FT_DONE, FT_SKIPPED, FT_FAILED)}
+    for r in c.execute(
+        "SELECT status, COUNT(*) AS n FROM film_task_items WHERE task_id=?"
+        " GROUP BY status",
+        (task_id,),
+    ):
+        counts[r["status"]] = r["n"]
+    return counts
+
+
+def film_failed_items(task_id: int) -> list[dict[str, Any]]:
+    rows = conn().execute(
+        "SELECT * FROM film_task_items WHERE task_id=? AND status=? ORDER BY id",
+        (task_id, FT_FAILED),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def film_running_task(kind: str) -> dict[str, Any] | None:
+    row = conn().execute(
+        "SELECT * FROM tasks WHERE kind=? AND status IN (?,?) ORDER BY id DESC LIMIT 1",
+        (kind, TASK_PENDING, TASK_RUNNING),
+    ).fetchone()
+    return _row(row)
+
+
+def film_set_task_running(task_id: int, running: bool) -> None:
+    """标记任务状态：false 时若还有条目则 completed，否则视调用方处理。"""
+    with _write_lock, conn() as c:
+        c.execute(
+            "UPDATE tasks SET status=?, rev=?, updated_at=? WHERE id=?",
+            (TASK_RUNNING if running else TASK_COMPLETED, next_rev(), time.time(), task_id),
+        )
+        c.commit()
+
+
 # ---------------------------------------------------------------- 统一图库
 
 def library_get(code: str) -> dict[str, Any] | None:
@@ -620,6 +789,13 @@ def library_get(code: str) -> dict[str, Any] | None:
     if not row:
         return None
     data = dict(row)
+    if data.get("actresses"):
+        try:
+            data["actresses"] = json.loads(data["actresses"])
+        except ValueError:
+            data["actresses"] = []
+    else:
+        data["actresses"] = []
     data["images"] = [
         dict(r)
         for r in c.execute(
@@ -634,17 +810,21 @@ def library_upsert(
     detail_url: str | None,
     title: str | None,
     images: list[dict[str, Any]],
+    actresses: list[str] | None = None,
 ) -> None:
     """把某个番号的最终结果写入图库（pending 状态不写，避免脏数据）。"""
     keep = [i for i in images if i["status"] != IMG_PENDING]
     if not keep:
         return
+    actress_json = json.dumps(actresses or [], ensure_ascii=False)
     with _write_lock, conn() as c:
         c.execute(
-            "INSERT INTO library(code, detail_url, title, updated_at) VALUES(?,?,?,?)"
+            "INSERT INTO library(code, detail_url, title, actresses, updated_at)"
+            " VALUES(?,?,?,?,?)"
             " ON CONFLICT(code) DO UPDATE SET detail_url=excluded.detail_url,"
-            " title=excluded.title, updated_at=excluded.updated_at",
-            (code, detail_url, title, time.time()),
+            " title=excluded.title, actresses=excluded.actresses,"
+            " updated_at=excluded.updated_at",
+            (code, detail_url, title, actress_json, time.time()),
         )
         c.execute("DELETE FROM library_images WHERE code=?", (code,))
         c.executemany(
